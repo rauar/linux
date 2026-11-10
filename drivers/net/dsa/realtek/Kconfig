@@ -50,4 +50,14 @@ config NET_DSA_REALTEK_RTL8366RB_LEDS
 	depends on NET_DSA_REALTEK_RTL8366RB
 	default NET_DSA_REALTEK_RTL8366RB
 
+config NET_DSA_REALTEK_RTL8372N
+	tristate "Realtek RTL8372N switch driver"
+	depends on NET_DSA_REALTEK_MDIO
+	select NET_DSA_TAG_RTL8_4
+	help
+	  Select to enable support for the Realtek RTL8372N Ethernet switch.
+	  It has four ports with internal 2.5GBASE-T PHYs and two SerDes
+	  ports, and is managed over MDIO. One SerDes port usually connects
+	  to the CPU with 10GBASE-R.
+
 endif

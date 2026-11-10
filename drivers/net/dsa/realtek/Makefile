@@ -14,3 +14,5 @@ rtl8365mb-y				:= rtl8365mb_main.o \
 					   rtl8365mb_vlan.o \
 					   rtl8365mb_l2.o \
 					   rtl8365mb_qos.o
+
+obj-$(CONFIG_NET_DSA_REALTEK_RTL8372N) += rtl8372n.o

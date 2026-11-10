@@ -1,0 +1,1050 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Realtek RTL8372N DSA switch driver
+ *
+ * The register addresses, values and setup sequences are based on the
+ * rtl837x DSA driver by StarField Xu.
+ */
+#include <linux/array_size.h>
+#include <linux/bitfield.h>
+#include <linux/bitops.h>
+#include <linux/bits.h>
+#include <linux/container_of.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/if_vlan.h>
+#include <linux/mdio.h>
+#include <linux/mod_devicetable.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/phy.h>
+#include <linux/phylink.h>
+#include <linux/regmap.h>
+#include <linux/wordpart.h>
+#include <net/dsa.h>
+
+#include "realtek.h"
+#include "realtek-mdio.h"
+#include "rtl83xx.h"
+
+#define RTL8372N_CHIP_MODEL_REG		0x0004
+#define RTL8372N_CHIP_MODEL_RTL8372N	0x83727000
+
+#define RTL8372N_RESET_REG		0x0024
+#define RTL8372N_RESET_SOFT		BIT(0)
+
+#define RTL8372N_PORT_ISOLATION_REG(port)	(0x50c0 + (port) * 4)
+
+/* Maximum frame length per port: one field for 10/100 Mbit/s links,
+ * one for 1 Gbit/s and faster
+ */
+#define RTL8372N_PORT_MAX_LEN_REG(port)	(0x1250 + (port) * 0x100)
+#define RTL8372N_PORT_MAX_LEN_FE	GENMASK(13, 0)
+#define RTL8372N_PORT_MAX_LEN_GE	GENMASK(27, 14)
+#define RTL8372N_PORT_MAX_LEN_MAX	0x3fff
+
+/* MIB counters: a command selects port and counter, then the value is read */
+#define RTL8372N_MIB_CMD_REG		0x0f60
+#define RTL8372N_MIB_CMD_BUSY		BIT(0)
+#define RTL8372N_MIB_CMD_PORT		GENMASK(4, 1)
+#define RTL8372N_MIB_CMD_COUNTER	GENMASK(10, 5)
+#define RTL8372N_MIB_DATA_HI_REG	0x0f64
+#define RTL8372N_MIB_DATA_LO_REG	0x0f68
+
+#define RTL8372N_EXT_CPU_PORT_REG	0x6724
+#define RTL8372N_EXT_CPU_PORT		GENMASK(3, 0)
+
+#define RTL8372N_CPU_CTRL_REG		0x6720
+#define RTL8372N_CPU_CTRL_TAG_EN	BIT(1)
+#define RTL8372N_CPU_CTRL_INSERT_MODE	GENMASK(11, 10)
+#define RTL8372N_CPU_CTRL_INSERT_ALL	0
+
+#define RTL8372N_CPU_TAG_AWARE_REG	0x603c
+
+#define RTL8372N_L2_LIMIT_ACTION_REG		0x4f80
+#define RTL8372N_L2_LIMIT_ACTION		GENMASK(1, 0)
+#define RTL8372N_L2_LIMIT_ACTION_FORWARD	0
+
+#define RTL8372N_L2_LEARN_LIMIT_REG(port)	(0x5384 + (port) * 4)
+#define RTL8372N_L2_LEARN_LIMIT			GENMASK(12, 0)
+
+#define RTL8372N_SDS_CMD_REG		0x03f8
+#define RTL8372N_SDS_CMD_INDEX		BIT(0)
+#define RTL8372N_SDS_CMD_PAGE		GENMASK(6, 1)
+#define RTL8372N_SDS_CMD_REGNUM		GENMASK(11, 7)
+#define RTL8372N_SDS_CMD_RW		BIT(14)
+#define RTL8372N_SDS_CMD_RW_READ	0
+#define RTL8372N_SDS_CMD_RW_WRITE	1
+#define RTL8372N_SDS_CMD_EXEC		BIT(15)
+#define RTL8372N_SDS_RDATA_REG		0x03fc
+#define RTL8372N_SDS_WDATA_REG		0x0400
+
+#define RTL8372N_SDS_FRC_PAGE		0x20
+#define RTL8372N_SDS_FRC_REG		0x00
+#define RTL8372N_SDS_FRC_RX		GENMASK(5, 4)
+#define RTL8372N_SDS_FRC_PDOWN		GENMASK(7, 6)
+#define RTL8372N_SDS_FRC_CMU		GENMASK(11, 10)
+#define RTL8372N_SDS_FRC_AUTO		0
+#define RTL8372N_SDS_FRC_0		1
+#define RTL8372N_SDS_FRC_1		3
+
+#define RTL8372N_SDS_MODE_REG		0x7b20
+#define RTL8372N_SDS_MODE_SDS0		GENMASK(4, 0)
+#define RTL8372N_SDS_MODE_SDS1		GENMASK(9, 5)
+#define RTL8372N_SDS_MODE_SDS0_USX_SUB	GENMASK(14, 10)
+#define RTL8372N_SDS_MODE_SDS1_USX_SUB	GENMASK(20, 16)
+#define RTL8372N_SDS_MODE_MAC3_8221B	BIT(21)
+#define RTL8372N_SDS_MODE_MAC8_8221B	BIT(22)
+#define RTL8372N_SDS_MODE_10GBASER	0x1a
+
+#define RTL8372N_CHIP_INFO_REG		0x000c
+#define RTL8372N_CHIP_INFO_EN		GENMASK(19, 16)
+#define RTL8372N_CHIP_INFO_EN_KEY	0xa
+#define RTL8372N_CHIP_INFO_VER		GENMASK(31, 28)
+
+#define RTL8372N_PHY_MASK_REG		0x6438
+#define RTL8372N_PHY_MASK		GENMASK(8, 0)
+#define RTL8372N_PHY_CMD_REG		0x643c
+#define RTL8372N_PHY_CMD_EXEC		BIT(0)
+#define RTL8372N_PHY_CMD_C45		BIT(1)
+#define RTL8372N_PHY_CMD_RW		BIT(2)
+#define RTL8372N_PHY_CMD_RW_READ	0
+#define RTL8372N_PHY_CMD_RW_WRITE	1
+#define RTL8372N_PHY_CMD_REGNUM		GENMASK(18, 3)
+#define RTL8372N_PHY_CMD_DEVAD		GENMASK(23, 19)
+#define RTL8372N_PHY_CMD_FAIL		GENMASK(26, 24)
+#define RTL8372N_PHY_ADDR_MAX		8
+#define RTL8372N_PHY_RDATA_REG		0x6440
+#define RTL8372N_PHY_WDATA_REG		0x6444
+
+#define RTL8372N_SMI_POLL_CTRL_REG	0x632c
+#define RTL8372N_SMI_POLL_MASK		GENMASK(20, 12)
+#define RTL8372N_SMI_MAC_TYPE_REG	0x6330
+#define RTL8372N_SMI_MAC_TYPE_P3	GENMASK(7, 6)
+#define RTL8372N_SMI_MAC_TYPE_P8	GENMASK(17, 16)
+#define RTL8372N_SMI_POLL_SEL_REG	0x6334
+#define RTL8372N_SMI_CTRL_REG		0x6454
+#define RTL8372N_SMI_CTRL_MDC_EN	GENMASK(14, 12)	/* MDC clock of SMI 0-2 */
+
+#define RTL8372N_SERDES_PORTS		(BIT(3) | BIT(8))
+#define RTL8372N_LINK_STATUS_REG	0x63e8	/* link up, one bit per port */
+#define RTL8372N_INT_PHY_PORTS		GENMASK(7, 4)
+
+#define RTL8372N_NUM_PORTS		9
+
+struct rtl8372n_sds_step {
+	u16 field;
+	u16 val;
+	unsigned int delay_ms;
+};
+
+struct rtl8372n_sds_reg {
+	u8 page;
+	u8 reg;
+	u16 val;
+};
+
+struct rtl8372n_pcs {
+	struct phylink_pcs pcs;
+	struct realtek_priv *priv;
+	int sds;
+	int port;
+};
+
+/* Chip data, in realtek_priv::chip_data */
+struct rtl8372n {
+	struct mutex sds_lock;		/* SerDes access sequences (0x03f8-0x0400) */
+	struct mutex mib_lock;		/* MIB access sequences (0x0f60-0x0f68) */
+	u32 chip_ver;
+	struct rtl8372n_pcs pcs[2];	/* one per SerDes */
+};
+
+/* Wait until the SerDes access unit has finished its last command */
+static int rtl8372n_sds_wait(struct realtek_priv *priv)
+{
+	u32 val;
+
+	return regmap_read_poll_timeout(priv->map, RTL8372N_SDS_CMD_REG, val,
+					!(val & RTL8372N_SDS_CMD_EXEC), 10,
+					10 * USEC_PER_MSEC);
+}
+
+static u32 rtl8372n_sds_prep_cmd(int sds, int page, int reg, int rw)
+{
+	return FIELD_PREP(RTL8372N_SDS_CMD_INDEX, sds) |
+	       FIELD_PREP(RTL8372N_SDS_CMD_PAGE, page) |
+	       FIELD_PREP(RTL8372N_SDS_CMD_REGNUM, reg) |
+	       FIELD_PREP(RTL8372N_SDS_CMD_RW, rw) |
+	       RTL8372N_SDS_CMD_EXEC;
+}
+
+static int __rtl8372n_sds_read(struct realtek_priv *priv, int sds, int page,
+			       int reg, u16 *val)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	u32 data;
+	int ret;
+
+	lockdep_assert_held(&chip->sds_lock);
+
+	ret = rtl8372n_sds_wait(priv);
+	if (ret)
+		return ret;
+	ret = regmap_write(priv->map, RTL8372N_SDS_CMD_REG,
+			   rtl8372n_sds_prep_cmd(sds, page, reg,
+						 RTL8372N_SDS_CMD_RW_READ));
+	if (ret)
+		return ret;
+	ret = rtl8372n_sds_wait(priv);
+	if (ret)
+		return ret;
+	ret = regmap_read(priv->map, RTL8372N_SDS_RDATA_REG, &data);
+	if (!ret)
+		*val = lower_16_bits(data);
+	return ret;
+}
+
+static int __rtl8372n_sds_write(struct realtek_priv *priv, int sds, int page,
+				int reg, u16 val)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	int ret;
+
+	lockdep_assert_held(&chip->sds_lock);
+
+	ret = rtl8372n_sds_wait(priv);
+	if (ret)
+		return ret;
+	ret = regmap_write(priv->map, RTL8372N_SDS_WDATA_REG, val);
+	if (ret)
+		return ret;
+	ret = regmap_write(priv->map, RTL8372N_SDS_CMD_REG,
+			   rtl8372n_sds_prep_cmd(sds, page, reg,
+						 RTL8372N_SDS_CMD_RW_WRITE));
+	if (ret)
+		return ret;
+	return rtl8372n_sds_wait(priv);
+}
+
+static int rtl8372n_sds_write(struct realtek_priv *priv, int sds, int page,
+			      int reg, u16 val)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	int ret;
+
+	mutex_lock(&chip->sds_lock);
+	ret = __rtl8372n_sds_write(priv, sds, page, reg, val);
+	mutex_unlock(&chip->sds_lock);
+	return ret;
+}
+
+static int rtl8372n_sds_update_bits(struct realtek_priv *priv, int sds,
+				    int page, int reg, u16 mask, u16 val)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	u16 old;
+	int ret;
+
+	mutex_lock(&chip->sds_lock);
+	ret = __rtl8372n_sds_read(priv, sds, page, reg, &old);
+	if (!ret)
+		ret = __rtl8372n_sds_write(priv, sds, page, reg,
+					   (old & ~mask) | (val & mask));
+	mutex_unlock(&chip->sds_lock);
+	return ret;
+}
+
+static int rtl8372n_sds_run_steps(struct realtek_priv *priv, int sds,
+				  const struct rtl8372n_sds_step *steps,
+				  int num_steps)
+{
+	const struct rtl8372n_sds_step *step;
+	int i, ret;
+
+	for (i = 0; i < num_steps; i++) {
+		step = &steps[i];
+		ret = rtl8372n_sds_update_bits(priv, sds, RTL8372N_SDS_FRC_PAGE,
+					       RTL8372N_SDS_FRC_REG, step->field,
+					       field_prep(step->field,
+							  step->val));
+		if (ret)
+			return ret;
+		msleep(step->delay_ms);
+	}
+	return 0;
+}
+
+static const struct rtl8372n_sds_step rtl8372n_sds_off_steps[] = {
+	{ RTL8372N_SDS_FRC_RX, RTL8372N_SDS_FRC_1, 20 },
+	{ RTL8372N_SDS_FRC_RX, RTL8372N_SDS_FRC_0, 50 },
+	{ RTL8372N_SDS_FRC_PDOWN, RTL8372N_SDS_FRC_0, 20 },
+	{ RTL8372N_SDS_FRC_PDOWN, RTL8372N_SDS_FRC_1, 50 },
+	{ RTL8372N_SDS_FRC_CMU, RTL8372N_SDS_FRC_1, 20 },
+	{ RTL8372N_SDS_FRC_CMU, RTL8372N_SDS_FRC_0, 50 },
+};
+
+static const struct rtl8372n_sds_step rtl8372n_sds_on_steps[] = {
+	{ RTL8372N_SDS_FRC_CMU, RTL8372N_SDS_FRC_0, 20 },
+	{ RTL8372N_SDS_FRC_CMU, RTL8372N_SDS_FRC_1, 50 },
+	{ RTL8372N_SDS_FRC_CMU, RTL8372N_SDS_FRC_AUTO, 20 },
+	{ RTL8372N_SDS_FRC_PDOWN, RTL8372N_SDS_FRC_1, 20 },
+	{ RTL8372N_SDS_FRC_PDOWN, RTL8372N_SDS_FRC_0, 50 },
+	{ RTL8372N_SDS_FRC_PDOWN, RTL8372N_SDS_FRC_AUTO, 20 },
+	{ RTL8372N_SDS_FRC_RX, RTL8372N_SDS_FRC_0, 20 },
+	{ RTL8372N_SDS_FRC_RX, RTL8372N_SDS_FRC_1, 50 },
+	{ RTL8372N_SDS_FRC_RX, RTL8372N_SDS_FRC_AUTO, 50 },
+};
+
+static int rtl8372n_sds_off(struct realtek_priv *priv, int sds)
+{
+	return rtl8372n_sds_run_steps(priv, sds, rtl8372n_sds_off_steps,
+				      ARRAY_SIZE(rtl8372n_sds_off_steps));
+}
+
+static int rtl8372n_sds_on(struct realtek_priv *priv, int sds)
+{
+	return rtl8372n_sds_run_steps(priv, sds, rtl8372n_sds_on_steps,
+				      ARRAY_SIZE(rtl8372n_sds_on_steps));
+}
+
+static int rtl8372n_sds_set_mode(struct realtek_priv *priv, int sds, u32 mode)
+{
+	u32 mode_mask = sds ? RTL8372N_SDS_MODE_SDS1 : RTL8372N_SDS_MODE_SDS0;
+	u32 sub_mask = sds ? RTL8372N_SDS_MODE_SDS1_USX_SUB :
+			     RTL8372N_SDS_MODE_SDS0_USX_SUB;
+	u32 mac_8221b = sds ? RTL8372N_SDS_MODE_MAC8_8221B :
+			      RTL8372N_SDS_MODE_MAC3_8221B;
+
+	return regmap_update_bits(priv->map, RTL8372N_SDS_MODE_REG,
+				  mode_mask | sub_mask | mac_8221b,
+				  field_prep(mode_mask, mode));
+}
+
+/* Vendor values for 10.3125 Gbaud (10GBASE-R, USXGMII); meaning undocumented */
+static const struct rtl8372n_sds_reg rtl8372n_sds_10g_a[] = {
+	{ 0x21, 0x10, 0x4480 }, { 0x21, 0x13, 0x0400 }, { 0x21, 0x18, 0x6d02 },
+	{ 0x21, 0x1b, 0x424e }, { 0x21, 0x1d, 0x0002 }, { 0x36, 0x1c, 0x1390 },
+	{ 0x2e, 0x04, 0x0080 }, { 0x2e, 0x06, 0x0408 }, { 0x2e, 0x07, 0x020d },
+	{ 0x2e, 0x09, 0x0601 }, { 0x2e, 0x0b, 0x222c }, { 0x2e, 0x0c, 0x9217 },
+	{ 0x2e, 0x16, 0x0743 }, { 0x2e, 0x1d, 0xabb0 },
+};
+
+static const struct rtl8372n_sds_reg rtl8372n_sds_10g_b[] = {
+	{ 0x21, 0x10, 0x4480 }, { 0x21, 0x13, 0x0400 }, { 0x21, 0x18, 0x6d02 },
+	{ 0x21, 0x1b, 0x424e }, { 0x21, 0x1d, 0x0002 }, { 0x36, 0x1c, 0x1390 },
+	{ 0x36, 0x14, 0x003f }, { 0x36, 0x10, 0x0200 }, { 0x2e, 0x04, 0x0080 },
+	{ 0x2e, 0x06, 0x0408 }, { 0x2e, 0x07, 0x020d }, { 0x2e, 0x09, 0x0601 },
+	{ 0x2e, 0x0b, 0x222c }, { 0x2e, 0x0c, 0xa217 }, { 0x2e, 0x0d, 0xfe40 },
+	{ 0x2e, 0x15, 0xf5c1 }, { 0x2e, 0x16, 0x0443 }, { 0x2e, 0x1d, 0xabb0 },
+};
+
+/* Vendor values for the switch side of the link; meaning undocumented */
+static const struct rtl8372n_sds_reg rtl8372n_sds_mac[] = {
+	{ 0x06, 0x12, 0x5078 }, { 0x07, 0x06, 0x9401 }, { 0x07, 0x08, 0x9401 },
+	{ 0x07, 0x0a, 0x9401 }, { 0x07, 0x0c, 0x9401 }, { 0x1f, 0x0b, 0x0003 },
+	{ 0x06, 0x03, 0xc45c }, { 0x06, 0x1f, 0x2100 },
+};
+
+static int rtl8372n_sds_write_regs(struct realtek_priv *priv, int sds,
+				   const struct rtl8372n_sds_reg *regs,
+				   int num_regs)
+{
+	int i, ret;
+
+	for (i = 0; i < num_regs; i++) {
+		ret = rtl8372n_sds_write(priv, sds, regs[i].page, regs[i].reg,
+					 regs[i].val);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int rtl8372n_sds_tune_10g(struct realtek_priv *priv, int sds)
+{
+	const struct rtl8372n_sds_reg *regs = rtl8372n_sds_10g_b;
+	int num_regs = ARRAY_SIZE(rtl8372n_sds_10g_b);
+	struct rtl8372n *chip = priv->chip_data;
+	int ret;
+
+	if (chip->chip_ver == 0) {
+		regs = rtl8372n_sds_10g_a;
+		num_regs = ARRAY_SIZE(rtl8372n_sds_10g_a);
+	}
+	ret = rtl8372n_sds_write_regs(priv, sds, regs, num_regs);
+	if (ret)
+		return ret;
+
+	return rtl8372n_sds_write_regs(priv, sds, rtl8372n_sds_mac,
+				       ARRAY_SIZE(rtl8372n_sds_mac));
+}
+
+static struct rtl8372n_pcs *to_rtl8372n_pcs(struct phylink_pcs *pcs)
+{
+	return container_of(pcs, struct rtl8372n_pcs, pcs);
+}
+
+static int rtl8372n_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+			       phy_interface_t interface,
+			       const unsigned long *advertising,
+			       bool permit_pause_to_mac)
+{
+	struct rtl8372n_pcs *rpcs = to_rtl8372n_pcs(pcs);
+	struct realtek_priv *priv = rpcs->priv;
+	int ret;
+
+	if (interface != PHY_INTERFACE_MODE_10GBASER)
+		return -EOPNOTSUPP;
+
+	ret = rtl8372n_sds_off(priv, rpcs->sds);
+	if (ret)
+		return ret;
+	ret = rtl8372n_sds_set_mode(priv, rpcs->sds, RTL8372N_SDS_MODE_10GBASER);
+	if (ret)
+		return ret;
+	ret = rtl8372n_sds_tune_10g(priv, rpcs->sds);
+	if (ret)
+		return ret;
+	msleep(250);
+
+	return rtl8372n_sds_on(priv, rpcs->sds);
+}
+
+static unsigned int rtl8372n_pcs_inband_caps(struct phylink_pcs *pcs,
+					     phy_interface_t interface)
+{
+	/* 10GBASE-R has no in-band negotiation */
+	if (interface == PHY_INTERFACE_MODE_10GBASER)
+		return LINK_INBAND_DISABLE;
+
+	return 0;
+}
+
+static void rtl8372n_pcs_get_state(struct phylink_pcs *pcs,
+				   unsigned int neg_mode,
+				   struct phylink_link_state *state)
+{
+	struct rtl8372n_pcs *rpcs = to_rtl8372n_pcs(pcs);
+	u32 val;
+
+	state->link = false;
+	if (regmap_read(rpcs->priv->map, RTL8372N_LINK_STATUS_REG, &val))
+		return;
+
+	state->link = !!(val & BIT(rpcs->port));
+	state->speed = SPEED_10000;
+	state->duplex = DUPLEX_FULL;
+}
+
+static const struct phylink_pcs_ops rtl8372n_pcs_ops = {
+	.pcs_inband_caps = rtl8372n_pcs_inband_caps,
+	.pcs_get_state = rtl8372n_pcs_get_state,
+	.pcs_config = rtl8372n_pcs_config,
+};
+
+static int rtl8372n_phy_wait(struct realtek_priv *priv)
+{
+	u32 cmd;
+	int ret;
+
+	ret = regmap_read_poll_timeout(priv->map, RTL8372N_PHY_CMD_REG, cmd,
+				       !(cmd & RTL8372N_PHY_CMD_EXEC), 10,
+				       10 * USEC_PER_MSEC);
+	if (ret)
+		return ret;
+
+	return cmd & RTL8372N_PHY_CMD_FAIL ? -EIO : 0;
+}
+
+static u32 rtl8372n_phy_prep_cmd(int devad, int reg, int rw)
+{
+	return FIELD_PREP(RTL8372N_PHY_CMD_DEVAD, devad) |
+	       FIELD_PREP(RTL8372N_PHY_CMD_REGNUM, reg) |
+	       FIELD_PREP(RTL8372N_PHY_CMD_RW, rw) |
+	       RTL8372N_PHY_CMD_C45 | RTL8372N_PHY_CMD_EXEC;
+}
+
+/* Called with the user MDIO bus lock held, which serializes the sequence */
+static int rtl8372n_phy_read_c45(struct realtek_priv *priv, int addr,
+				 int devad, int reg)
+{
+	u32 val;
+	int ret;
+
+	if (addr > RTL8372N_PHY_ADDR_MAX)
+		return -EINVAL;
+
+	ret = regmap_write(priv->map, RTL8372N_PHY_WDATA_REG, addr);
+	if (ret)
+		return ret;
+	ret = regmap_write(priv->map, RTL8372N_PHY_CMD_REG,
+			   rtl8372n_phy_prep_cmd(devad, reg,
+						 RTL8372N_PHY_CMD_RW_READ));
+	if (ret)
+		return ret;
+	ret = rtl8372n_phy_wait(priv);
+	if (ret)
+		return ret;
+	ret = regmap_read(priv->map, RTL8372N_PHY_RDATA_REG, &val);
+	return ret ?: lower_16_bits(val);
+}
+
+static int rtl8372n_phy_write_c45(struct realtek_priv *priv, int addr,
+				  int devad, int reg, u16 val)
+{
+	int ret;
+
+	if (addr > RTL8372N_PHY_ADDR_MAX)
+		return -EINVAL;
+
+	ret = regmap_write(priv->map, RTL8372N_PHY_MASK_REG,
+			   FIELD_PREP(RTL8372N_PHY_MASK, BIT(addr)));
+	if (ret)
+		return ret;
+	ret = regmap_write(priv->map, RTL8372N_PHY_WDATA_REG, val);
+	if (ret)
+		return ret;
+	ret = regmap_write(priv->map, RTL8372N_PHY_CMD_REG,
+			   rtl8372n_phy_prep_cmd(devad, reg,
+						 RTL8372N_PHY_CMD_RW_WRITE));
+	if (ret)
+		return ret;
+
+	return rtl8372n_phy_wait(priv);
+}
+
+/* Ports 3 and 8 connect through SerDes 0 and 1 */
+static bool rtl8372n_is_serdes_port(int port)
+{
+	return port == 3 || port == 8;
+}
+
+static int rtl8372n_port_to_sds(int port)
+{
+	return port == 8 ? 1 : 0;
+}
+
+/* Ports 4-7 have the chip's internal PHYs */
+static bool rtl8372n_has_internal_phy(int port)
+{
+	return port >= 4 && port <= 7;
+}
+
+static enum dsa_tag_protocol
+rtl8372n_get_tag_protocol(struct dsa_switch *ds, int port,
+			  enum dsa_tag_protocol mprot)
+{
+	return DSA_TAG_PROTO_RTL8_4;
+}
+
+static int rtl8372n_soft_reset(struct realtek_priv *priv)
+{
+	u32 val;
+	int ret;
+
+	ret = regmap_write(priv->map, RTL8372N_RESET_REG, RTL8372N_RESET_SOFT);
+	if (ret)
+		return ret;
+
+	msleep(250);
+
+	return regmap_read_poll_timeout(priv->map, RTL8372N_RESET_REG, val,
+					!(val & RTL8372N_RESET_SOFT),
+					20 * USEC_PER_MSEC, USEC_PER_SEC);
+}
+
+static int rtl8372n_setup_isolation(struct realtek_priv *priv)
+{
+	struct dsa_port *dp;
+	int ret;
+
+	/* port_enable opens the path between a user port and the CPU port */
+	dsa_switch_for_each_port(dp, &priv->ds) {
+		ret = regmap_write(priv->map,
+				   RTL8372N_PORT_ISOLATION_REG(dp->index), 0);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int rtl8372n_setup_cpu_port(struct realtek_priv *priv)
+{
+	u32 cpu_ports = dsa_cpu_ports(&priv->ds);
+	int cpu, ret;
+
+	if (hweight32(cpu_ports) != 1) {
+		dev_err(priv->dev, "exactly one CPU port is supported\n");
+		return -EINVAL;
+	}
+	cpu = __ffs(cpu_ports);
+
+	ret = regmap_update_bits(priv->map, RTL8372N_EXT_CPU_PORT_REG,
+				 RTL8372N_EXT_CPU_PORT,
+				 FIELD_PREP(RTL8372N_EXT_CPU_PORT, cpu));
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_CPU_CTRL_REG,
+				 RTL8372N_CPU_CTRL_INSERT_MODE |
+				 RTL8372N_CPU_CTRL_TAG_EN,
+				 FIELD_PREP(RTL8372N_CPU_CTRL_INSERT_MODE,
+					    RTL8372N_CPU_CTRL_INSERT_ALL) |
+				 RTL8372N_CPU_CTRL_TAG_EN);
+	if (ret)
+		return ret;
+
+	return regmap_update_bits(priv->map, RTL8372N_CPU_TAG_AWARE_REG,
+				  BIT(cpu), BIT(cpu));
+}
+
+static int rtl8372n_setup_learning(struct realtek_priv *priv)
+{
+	struct dsa_port *dp;
+	int ret;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_L2_LIMIT_ACTION_REG,
+				 RTL8372N_L2_LIMIT_ACTION,
+				 FIELD_PREP(RTL8372N_L2_LIMIT_ACTION,
+					    RTL8372N_L2_LIMIT_ACTION_FORWARD));
+	if (ret)
+		return ret;
+
+	dsa_switch_for_each_port(dp, &priv->ds) {
+		ret = regmap_update_bits(priv->map,
+					 RTL8372N_L2_LEARN_LIMIT_REG(dp->index),
+					 RTL8372N_L2_LEARN_LIMIT, 0);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int rtl8372n_setup_polling(struct realtek_priv *priv)
+{
+	int ret;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_SMI_MAC_TYPE_REG,
+				 RTL8372N_SMI_MAC_TYPE_P3 |
+				 RTL8372N_SMI_MAC_TYPE_P8, 0);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_SMI_POLL_SEL_REG,
+				 RTL8372N_INT_PHY_PORTS,
+				 RTL8372N_INT_PHY_PORTS);
+	if (ret)
+		return ret;
+
+	return regmap_update_bits(priv->map, RTL8372N_SMI_POLL_CTRL_REG,
+				  RTL8372N_SMI_POLL_MASK,
+				  FIELD_PREP(RTL8372N_SMI_POLL_MASK,
+					     RTL8372N_SERDES_PORTS |
+					     RTL8372N_INT_PHY_PORTS));
+}
+
+/* The PHY access unit needs the MDC clock of the MDIO masters */
+static int rtl8372n_setup_smi(struct realtek_priv *priv)
+{
+	return regmap_update_bits(priv->map, RTL8372N_SMI_CTRL_REG,
+				  RTL8372N_SMI_CTRL_MDC_EN,
+				  RTL8372N_SMI_CTRL_MDC_EN);
+}
+
+static int rtl8372n_setup(struct dsa_switch *ds)
+{
+	struct realtek_priv *priv = ds->priv;
+	int ret;
+
+	ret = rtl8372n_soft_reset(priv);
+	if (ret) {
+		dev_err(ds->dev, "soft reset failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_isolation(priv);
+	if (ret) {
+		dev_err(ds->dev, "port isolation failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_cpu_port(priv);
+	if (ret) {
+		dev_err(ds->dev, "CPU port setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_learning(priv);
+	if (ret) {
+		dev_err(ds->dev, "learning setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_polling(priv);
+	if (ret) {
+		dev_err(ds->dev, "polling setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_smi(priv);
+	if (ret) {
+		dev_err(ds->dev, "MDIO master setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl83xx_setup_user_mdio(ds);
+	if (ret)
+		dev_err(ds->dev, "MDIO bus setup failed: %pe\n", ERR_PTR(ret));
+
+	return ret;
+}
+
+static void rtl8372n_phylink_get_caps(struct dsa_switch *ds, int port,
+				      struct phylink_config *config)
+{
+	if (rtl8372n_has_internal_phy(port)) {
+		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
+			  config->supported_interfaces);
+		config->mac_capabilities = MAC_10 | MAC_100 | MAC_1000FD |
+					   MAC_2500FD | MAC_SYM_PAUSE |
+					   MAC_ASYM_PAUSE;
+	} else if (rtl8372n_is_serdes_port(port)) {
+		__set_bit(PHY_INTERFACE_MODE_10GBASER,
+			  config->supported_interfaces);
+		config->mac_capabilities = MAC_10000FD | MAC_SYM_PAUSE |
+					   MAC_ASYM_PAUSE;
+	}
+}
+
+static struct phylink_pcs *
+rtl8372n_mac_select_pcs(struct phylink_config *config,
+			phy_interface_t interface)
+{
+	struct dsa_port *dp = dsa_phylink_to_port(config);
+	struct realtek_priv *priv = dp->ds->priv;
+	struct rtl8372n *chip = priv->chip_data;
+
+	if (!rtl8372n_is_serdes_port(dp->index))
+		return NULL;
+
+	return &chip->pcs[rtl8372n_port_to_sds(dp->index)].pcs;
+}
+
+static void rtl8372n_mac_config(struct phylink_config *config,
+				unsigned int mode,
+				const struct phylink_link_state *state)
+{
+}
+
+static void rtl8372n_mac_link_down(struct phylink_config *config,
+				   unsigned int mode,
+				   phy_interface_t interface)
+{
+}
+
+static void rtl8372n_mac_link_up(struct phylink_config *config,
+				 struct phy_device *phy, unsigned int mode,
+				 phy_interface_t interface, int speed,
+				 int duplex, bool tx_pause, bool rx_pause)
+{
+}
+
+static const struct phylink_mac_ops rtl8372n_phylink_mac_ops = {
+	.mac_select_pcs = rtl8372n_mac_select_pcs,
+	.mac_config = rtl8372n_mac_config,
+	.mac_link_down = rtl8372n_mac_link_down,
+	.mac_link_up = rtl8372n_mac_link_up,
+};
+
+static int rtl8372n_port_enable(struct dsa_switch *ds, int port,
+				struct phy_device *phy)
+{
+	int cpu = dsa_upstream_port(ds, port);
+	struct realtek_priv *priv = ds->priv;
+	int ret;
+
+	if (!dsa_is_user_port(ds, port))
+		return 0;
+
+	/* The port forwards to the CPU port only, and the CPU port to it */
+	ret = regmap_write(priv->map, RTL8372N_PORT_ISOLATION_REG(port),
+			   BIT(cpu));
+	if (ret)
+		return ret;
+
+	return regmap_update_bits(priv->map, RTL8372N_PORT_ISOLATION_REG(cpu),
+				  BIT(port), BIT(port));
+}
+
+static void rtl8372n_port_disable(struct dsa_switch *ds, int port)
+{
+	int cpu = dsa_upstream_port(ds, port);
+	struct realtek_priv *priv = ds->priv;
+	int ret;
+
+	if (!dsa_is_user_port(ds, port))
+		return;
+
+	ret = regmap_write(priv->map, RTL8372N_PORT_ISOLATION_REG(port), 0);
+	if (!ret)
+		ret = regmap_update_bits(priv->map,
+					 RTL8372N_PORT_ISOLATION_REG(cpu),
+					 BIT(port), 0);
+	if (ret)
+		dev_err(priv->dev, "cannot isolate port %d: %pe\n", port,
+			ERR_PTR(ret));
+}
+
+static int rtl8372n_port_change_mtu(struct dsa_switch *ds, int port,
+				    int new_mtu)
+{
+	u32 len = new_mtu + VLAN_ETH_HLEN + ETH_FCS_LEN;
+	struct realtek_priv *priv = ds->priv;
+
+	if (len > RTL8372N_PORT_MAX_LEN_MAX)
+		return -EINVAL;
+
+	/* Both fields get the same length: the limit is the same at any speed */
+	return regmap_update_bits(priv->map, RTL8372N_PORT_MAX_LEN_REG(port),
+				  RTL8372N_PORT_MAX_LEN_FE |
+				  RTL8372N_PORT_MAX_LEN_GE,
+				  FIELD_PREP(RTL8372N_PORT_MAX_LEN_FE, len) |
+				  FIELD_PREP(RTL8372N_PORT_MAX_LEN_GE, len));
+}
+
+static int rtl8372n_port_max_mtu(struct dsa_switch *ds, int port)
+{
+	return RTL8372N_PORT_MAX_LEN_MAX - VLAN_ETH_HLEN - ETH_FCS_LEN;
+}
+
+/*
+ * A counter number selects a 64-bit slot that holds one 64-bit counter or
+ * two 32-bit counters (even word = high half, odd word = low half).
+ */
+struct rtl8372n_mib {
+	u8 word;	/* position in 32-bit words */
+	u8 words;	/* 1 or 2 */
+};
+
+enum {
+	RTL8372N_MIB_IN_OCTETS,
+	RTL8372N_MIB_OUT_OCTETS,
+	RTL8372N_MIB_IN_MCAST,
+	RTL8372N_MIB_IN_BCAST,
+	RTL8372N_MIB_OUT_MCAST,
+	RTL8372N_MIB_OUT_BCAST,
+	RTL8372N_MIB_SINGLE_COLL,
+	RTL8372N_MIB_MULTI_COLL,
+	RTL8372N_MIB_DEFERRED,
+	RTL8372N_MIB_LATE_COLL,
+	RTL8372N_MIB_EXCESS_COLL,
+	RTL8372N_MIB_RX_CRC_ERR,
+	RTL8372N_MIB_TX_GOOD,
+	RTL8372N_MIB_RX_GOOD,
+	RTL8372N_MIB_NUM
+};
+
+static const struct rtl8372n_mib rtl8372n_mibs[RTL8372N_MIB_NUM] = {
+	[RTL8372N_MIB_IN_OCTETS]	= {  0, 2 },
+	[RTL8372N_MIB_OUT_OCTETS]	= {  2, 2 },
+	[RTL8372N_MIB_IN_MCAST]		= {  6, 2 },
+	[RTL8372N_MIB_IN_BCAST]		= {  8, 2 },
+	[RTL8372N_MIB_OUT_MCAST]	= { 12, 2 },
+	[RTL8372N_MIB_OUT_BCAST]	= { 14, 2 },
+	[RTL8372N_MIB_SINGLE_COLL]	= { 18, 1 },
+	[RTL8372N_MIB_MULTI_COLL]	= { 19, 1 },
+	[RTL8372N_MIB_DEFERRED]		= { 20, 1 },
+	[RTL8372N_MIB_LATE_COLL]	= { 21, 1 },
+	[RTL8372N_MIB_EXCESS_COLL]	= { 22, 1 },
+	[RTL8372N_MIB_RX_CRC_ERR]	= { 31, 1 },
+	[RTL8372N_MIB_TX_GOOD]		= { 92, 2 },
+	[RTL8372N_MIB_RX_GOOD]		= { 94, 2 },
+};
+
+static int rtl8372n_mib_read(struct realtek_priv *priv, int port,
+			     const struct rtl8372n_mib *mib, u64 *val)
+{
+	u32 cmd, hi, lo;
+	int ret;
+
+	ret = regmap_write(priv->map, RTL8372N_MIB_CMD_REG,
+			   FIELD_PREP(RTL8372N_MIB_CMD_COUNTER, mib->word / 2) |
+			   FIELD_PREP(RTL8372N_MIB_CMD_PORT, port) |
+			   RTL8372N_MIB_CMD_BUSY);
+	if (ret)
+		return ret;
+
+	ret = regmap_read_poll_timeout(priv->map, RTL8372N_MIB_CMD_REG, cmd,
+				       !(cmd & RTL8372N_MIB_CMD_BUSY), 10,
+				       10 * USEC_PER_MSEC);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(priv->map, RTL8372N_MIB_DATA_HI_REG, &hi);
+	if (ret)
+		return ret;
+	ret = regmap_read(priv->map, RTL8372N_MIB_DATA_LO_REG, &lo);
+	if (ret)
+		return ret;
+
+	if (mib->words == 2)
+		*val = (u64)hi << 32 | lo;
+	else
+		*val = mib->word % 2 ? lo : hi;
+
+	return 0;
+}
+
+static void rtl8372n_get_eth_mac_stats(struct dsa_switch *ds, int port,
+				       struct ethtool_eth_mac_stats *mac_stats)
+{
+	struct realtek_priv *priv = ds->priv;
+	struct rtl8372n *chip = priv->chip_data;
+	u64 cnt[RTL8372N_MIB_NUM];
+	int i, ret = 0;
+
+	mutex_lock(&chip->mib_lock);
+	for (i = 0; i < RTL8372N_MIB_NUM && !ret; i++)
+		ret = rtl8372n_mib_read(priv, port, &rtl8372n_mibs[i], &cnt[i]);
+	mutex_unlock(&chip->mib_lock);
+	if (ret)
+		return;
+
+	mac_stats->FramesTransmittedOK = cnt[RTL8372N_MIB_TX_GOOD];
+	mac_stats->FramesReceivedOK = cnt[RTL8372N_MIB_RX_GOOD];
+	/* The octet counters include header and FCS, the IEEE ones do not */
+	mac_stats->OctetsTransmittedOK = cnt[RTL8372N_MIB_OUT_OCTETS] -
+		(ETH_HLEN + ETH_FCS_LEN) * cnt[RTL8372N_MIB_TX_GOOD];
+	mac_stats->OctetsReceivedOK = cnt[RTL8372N_MIB_IN_OCTETS] -
+		(ETH_HLEN + ETH_FCS_LEN) * cnt[RTL8372N_MIB_RX_GOOD];
+	mac_stats->MulticastFramesXmittedOK = cnt[RTL8372N_MIB_OUT_MCAST];
+	mac_stats->BroadcastFramesXmittedOK = cnt[RTL8372N_MIB_OUT_BCAST];
+	mac_stats->MulticastFramesReceivedOK = cnt[RTL8372N_MIB_IN_MCAST];
+	mac_stats->BroadcastFramesReceivedOK = cnt[RTL8372N_MIB_IN_BCAST];
+	mac_stats->FrameCheckSequenceErrors = cnt[RTL8372N_MIB_RX_CRC_ERR];
+	mac_stats->SingleCollisionFrames = cnt[RTL8372N_MIB_SINGLE_COLL];
+	mac_stats->MultipleCollisionFrames = cnt[RTL8372N_MIB_MULTI_COLL];
+	mac_stats->FramesWithDeferredXmissions = cnt[RTL8372N_MIB_DEFERRED];
+	mac_stats->LateCollisions = cnt[RTL8372N_MIB_LATE_COLL];
+	mac_stats->FramesAbortedDueToXSColls = cnt[RTL8372N_MIB_EXCESS_COLL];
+}
+
+static const struct dsa_switch_ops rtl8372n_switch_ops = {
+	.get_tag_protocol = rtl8372n_get_tag_protocol,
+	.setup = rtl8372n_setup,
+	.phylink_get_caps = rtl8372n_phylink_get_caps,
+	.port_enable = rtl8372n_port_enable,
+	.port_disable = rtl8372n_port_disable,
+	.port_change_mtu = rtl8372n_port_change_mtu,
+	.port_max_mtu = rtl8372n_port_max_mtu,
+	.get_eth_mac_stats = rtl8372n_get_eth_mac_stats,
+};
+
+/*
+ * The version field is only valid while the enable field holds the key,
+ * so set the key, read the register and clear the key again.
+ */
+static int rtl8372n_read_chip_ver(struct realtek_priv *priv)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	u32 val;
+	int ret;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_CHIP_INFO_REG,
+				 RTL8372N_CHIP_INFO_EN,
+				 FIELD_PREP(RTL8372N_CHIP_INFO_EN,
+					    RTL8372N_CHIP_INFO_EN_KEY));
+	if (ret)
+		return ret;
+
+	ret = regmap_read(priv->map, RTL8372N_CHIP_INFO_REG, &val);
+	if (!ret)
+		ret = regmap_update_bits(priv->map, RTL8372N_CHIP_INFO_REG,
+					 RTL8372N_CHIP_INFO_EN, 0);
+	if (ret)
+		return ret;
+
+	chip->chip_ver = FIELD_GET(RTL8372N_CHIP_INFO_VER, val);
+	return 0;
+}
+
+static int rtl8372n_detect(struct realtek_priv *priv)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	int i, ret;
+	u32 id;
+
+	ret = regmap_read(priv->map, RTL8372N_CHIP_MODEL_REG, &id);
+	if (ret)
+		return dev_err_probe(priv->dev, ret, "cannot read chip ID\n");
+
+	if (id != RTL8372N_CHIP_MODEL_RTL8372N) {
+		dev_err(priv->dev, "unrecognized switch, chip ID 0x%08x\n", id);
+		return -ENODEV;
+	}
+
+	ret = devm_mutex_init(priv->dev, &chip->sds_lock);
+	if (ret)
+		return ret;
+
+	ret = devm_mutex_init(priv->dev, &chip->mib_lock);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(chip->pcs); i++) {
+		chip->pcs[i].pcs.ops = &rtl8372n_pcs_ops;
+		chip->pcs[i].priv = priv;
+		chip->pcs[i].sds = i;
+		chip->pcs[i].port = i ? 8 : 3;
+		__set_bit(PHY_INTERFACE_MODE_10GBASER,
+			  chip->pcs[i].pcs.supported_interfaces);
+	}
+
+	ret = rtl8372n_read_chip_ver(priv);
+	if (ret)
+		return dev_err_probe(priv->dev, ret,
+				     "cannot read chip version\n");
+
+	dev_info(priv->dev, "found an RTL8372N switch, version %u\n",
+		 chip->chip_ver);
+
+	priv->num_ports = RTL8372N_NUM_PORTS;
+	return 0;
+}
+
+static const struct realtek_ops rtl8372n_ops = {
+	.detect = rtl8372n_detect,
+	.phy_read_c45 = rtl8372n_phy_read_c45,
+	.phy_write_c45 = rtl8372n_phy_write_c45,
+};
+
+static const struct realtek_variant rtl8372n_variant = {
+	.ds_ops = &rtl8372n_switch_ops,
+	.ops = &rtl8372n_ops,
+	.phylink_mac_ops = &rtl8372n_phylink_mac_ops,
+	.chip_data_sz = sizeof(struct rtl8372n),
+};
+
+static const struct of_device_id rtl8372n_of_match[] = {
+	{ .compatible = "realtek,rtl8372n", .data = &rtl8372n_variant },
+	{ /* end of list */ }
+};
+MODULE_DEVICE_TABLE(of, rtl8372n_of_match);
+
+static struct mdio_driver rtl8372n_driver = {
+	.mdiodrv.driver = {
+		.name = "rtl8372n",
+		.of_match_table = rtl8372n_of_match,
+	},
+	.probe = rtl837x_mdio_probe,
+	.remove = realtek_mdio_remove,
+	.shutdown = realtek_mdio_shutdown,
+};
+
+mdio_module_driver(rtl8372n_driver);
+
+MODULE_DESCRIPTION("RTL8372N DSA driver");
+MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("REALTEK_DSA");
