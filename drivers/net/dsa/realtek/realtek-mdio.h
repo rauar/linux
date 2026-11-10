@@ -16,6 +16,7 @@ static inline void realtek_mdio_driver_unregister(struct mdio_driver *drv)
 }
 
 int realtek_mdio_probe(struct mdio_device *mdiodev);
+int rtl837x_mdio_probe(struct mdio_device *mdiodev);
 void realtek_mdio_remove(struct mdio_device *mdiodev);
 void realtek_mdio_shutdown(struct mdio_device *mdiodev);
 
@@ -31,6 +32,11 @@ static inline void realtek_mdio_driver_unregister(struct mdio_driver *drv)
 }
 
 static inline int realtek_mdio_probe(struct mdio_device *mdiodev)
+{
+	return -ENOENT;
+}
+
+static inline int rtl837x_mdio_probe(struct mdio_device *mdiodev)
 {
 	return -ENOENT;
 }
