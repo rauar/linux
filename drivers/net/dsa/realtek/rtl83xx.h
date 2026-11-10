@@ -6,6 +6,10 @@
 struct realtek_interface_info {
 	int (*reg_read)(void *ctx, u32 reg, u32 *val);
 	int (*reg_write)(void *ctx, u32 reg, u32 val);
+	/* Register map geometry, 0 selects the SMI / MDIO default */
+	unsigned int reg_bits;
+	unsigned int val_bits;
+	unsigned int reg_stride;
 };
 
 void rtl83xx_lock(void *ctx);

@@ -191,6 +191,13 @@ rtl83xx_probe(struct device *dev,
 	if (ret)
 		return ERR_PTR(ret);
 
+	if (interface_info->reg_bits)
+		rc.reg_bits = interface_info->reg_bits;
+	if (interface_info->val_bits)
+		rc.val_bits = interface_info->val_bits;
+	if (interface_info->reg_stride)
+		rc.reg_stride = interface_info->reg_stride;
+
 	rc.lock_arg = priv;
 	priv->map = devm_regmap_init(dev, NULL, priv, &rc);
 	if (IS_ERR(priv->map)) {
