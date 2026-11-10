@@ -109,8 +109,10 @@ int rtl83xx_setup_user_mdio(struct dsa_switch *ds)
 
 	bus->priv = priv;
 	bus->name = "Realtek user MII";
-	bus->read = rtl83xx_user_mdio_read;
-	bus->write = rtl83xx_user_mdio_write;
+	if (priv->ops->phy_read)
+		bus->read = rtl83xx_user_mdio_read;
+	if (priv->ops->phy_write)
+		bus->write = rtl83xx_user_mdio_write;
 	if (priv->ops->phy_read_c45)
 		bus->read_c45 = rtl83xx_user_mdio_read_c45;
 	if (priv->ops->phy_write_c45)
