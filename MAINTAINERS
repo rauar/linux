@@ -23663,6 +23663,7 @@ M:	Linus Walleij <linusw@kernel.org>
 M:	Luiz Angelo Daros de Luca <luizluca@gmail.com>
 R:	Alvin Šipraga <alvin.sipraga@analog.com>
 S:	Maintained
+F:	Documentation/devicetree/bindings/net/dsa/realtek,rtl8372n.yaml
 F:	Documentation/devicetree/bindings/net/dsa/realtek.yaml
 F:	drivers/net/dsa/realtek/*
 
