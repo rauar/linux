@@ -2051,6 +2051,59 @@ static void rtl8372n_get_pause_stats(struct dsa_switch *ds, int port,
 		pause_stats->tx_pause_frames = val;
 }
 
+static const struct ethtool_rmon_hist_range rtl8372n_rmon_ranges[] = {
+	{ 64, 64 },
+	{ 65, 127 },
+	{ 128, 255 },
+	{ 256, 511 },
+	{ 512, 1023 },
+	{ 1024, 1518 },
+	{ 1519, RTL8372N_PORT_MAX_LEN_MAX },
+	{}
+};
+
+#define RTL8372N_RMON_HIST	(ARRAY_SIZE(rtl8372n_rmon_ranges) - 1)
+
+/* The RMON counters, one word each: undersized, oversized, fragments and
+ * jabbers received, then the frames per size range received and sent
+ */
+static const u8 rtl8372n_rmon_words[4 + 2 * RTL8372N_RMON_HIST] = {
+	33, 35, 37, 39,
+	42, 44, 46, 48, 50, 52, 56,
+	41, 43, 45, 47, 49, 51, 55,
+};
+
+static void rtl8372n_get_rmon_stats(struct dsa_switch *ds, int port,
+				    struct ethtool_rmon_stats *rmon_stats,
+				    const struct ethtool_rmon_hist_range **ranges)
+{
+	u64 cnt[ARRAY_SIZE(rtl8372n_rmon_words)];
+	struct rtl8372n_mib mib = { .words = 1 };
+	struct realtek_priv *priv = ds->priv;
+	struct rtl8372n *chip;
+	int i, ret = 0;
+
+	chip = priv->chip_data;
+	mutex_lock(&chip->mib_lock);
+	for (i = 0; i < ARRAY_SIZE(cnt) && !ret; i++) {
+		mib.word = rtl8372n_rmon_words[i];
+		ret = rtl8372n_mib_read(priv, port, &mib, &cnt[i]);
+	}
+	mutex_unlock(&chip->mib_lock);
+	if (ret)
+		return;
+
+	rmon_stats->undersize_pkts = cnt[0];
+	rmon_stats->oversize_pkts = cnt[1];
+	rmon_stats->fragments = cnt[2];
+	rmon_stats->jabbers = cnt[3];
+	for (i = 0; i < RTL8372N_RMON_HIST; i++) {
+		rmon_stats->hist[i] = cnt[4 + i];
+		rmon_stats->hist_tx[i] = cnt[4 + RTL8372N_RMON_HIST + i];
+	}
+	*ranges = rtl8372n_rmon_ranges;
+}
+
 /* The words of the key of an entry: the address and, like the entries the
  * switch learns, the VLAN ID for an entry of a VLAN and the filtering ID of
  * the bridge (0 outside a bridge) for any other
@@ -2287,6 +2340,7 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.get_eth_phy_stats = rtl8372n_get_eth_phy_stats,
 	.get_eth_mac_stats = rtl8372n_get_eth_mac_stats,
 	.get_eth_ctrl_stats = rtl8372n_get_eth_ctrl_stats,
+	.get_rmon_stats = rtl8372n_get_rmon_stats,
 	.get_pause_stats = rtl8372n_get_pause_stats,
 };
 
