@@ -12,6 +12,7 @@
 #include <linux/container_of.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
 #include <linux/mdio.h>
 #include <linux/mod_devicetable.h>
@@ -34,6 +35,17 @@
 #define RTL8372N_RESET_SOFT		BIT(0)
 
 #define RTL8372N_PORT_ISOLATION_REG(port)	(0x50c0 + (port) * 4)
+
+/* Spanning tree state of each port, two bits per port. There is one register
+ * per filtering database; the driver keeps them all the same.
+ */
+#define RTL8372N_STP_STATE_REG(fid)	(0x5310 + (fid) * 4)
+#define RTL8372N_STP_STATE_MASK(port)	(GENMASK(1, 0) << ((port) * 2))
+#define RTL8372N_STP_STATE_DISABLED	0
+#define RTL8372N_STP_STATE_BLOCKING	1
+#define RTL8372N_STP_STATE_LEARNING	2
+#define RTL8372N_STP_STATE_FORWARDING	3
+#define RTL8372N_NUM_FIDS		16
 
 /* Maximum frame length per port: one field for 10/100 Mbit/s links,
  * one for 1 Gbit/s and faster
@@ -912,6 +924,46 @@ static void rtl8372n_port_disable(struct dsa_switch *ds, int port)
 			ERR_PTR(ret));
 }
 
+static void rtl8372n_port_stp_state_set(struct dsa_switch *ds, int port,
+					u8 state)
+{
+	struct realtek_priv *priv = ds->priv;
+	int fid, ret;
+	u32 val;
+
+	switch (state) {
+	case BR_STATE_DISABLED:
+		val = RTL8372N_STP_STATE_DISABLED;
+		break;
+	case BR_STATE_BLOCKING:
+	case BR_STATE_LISTENING:
+		val = RTL8372N_STP_STATE_BLOCKING;
+		break;
+	case BR_STATE_LEARNING:
+		val = RTL8372N_STP_STATE_LEARNING;
+		break;
+	case BR_STATE_FORWARDING:
+		val = RTL8372N_STP_STATE_FORWARDING;
+		break;
+	default:
+		dev_err(priv->dev, "invalid STP state %u for port %d\n", state,
+			port);
+		return;
+	}
+
+	for (fid = 0; fid < RTL8372N_NUM_FIDS; fid++) {
+		ret = regmap_update_bits(priv->map,
+					 RTL8372N_STP_STATE_REG(fid),
+					 RTL8372N_STP_STATE_MASK(port),
+					 val << (port * 2));
+		if (ret) {
+			dev_err(priv->dev, "cannot set STP state of port %d: %pe\n",
+				port, ERR_PTR(ret));
+			return;
+		}
+	}
+}
+
 static int rtl8372n_port_change_mtu(struct dsa_switch *ds, int port,
 				    int new_mtu)
 {
@@ -1052,6 +1104,7 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.phylink_get_caps = rtl8372n_phylink_get_caps,
 	.port_enable = rtl8372n_port_enable,
 	.port_disable = rtl8372n_port_disable,
+	.port_stp_state_set = rtl8372n_port_stp_state_set,
 	.port_change_mtu = rtl8372n_port_change_mtu,
 	.port_max_mtu = rtl8372n_port_max_mtu,
 	.get_eth_mac_stats = rtl8372n_get_eth_mac_stats,
