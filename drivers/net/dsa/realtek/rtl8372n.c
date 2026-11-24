@@ -125,6 +125,37 @@
 #define RTL8372N_VLAN_PVID_REG(port)		(0x4e1c + ((port) / 2) * 4)
 #define RTL8372N_VLAN_PVID(port)		(GENMASK(11, 0) << (((port) % 2) * 12))
 
+/* VLAN membership check. RTL8372N_VLAN_CTRL_FILTER turns it on for the whole
+ * switch; without it no port drops a frame for its VLAN, whatever the other
+ * two registers say. With it, a frame of a VLAN is dropped
+ * - when it arrives on a port that is set in RTL8372N_VLAN_INGRESS_FILTER_REG
+ *   and is not a member of the VLAN, and
+ * - at each port that would send it and is not a member of the VLAN, unless
+ *   RTL8372N_VLAN_EGRESS_FREE of that port has the receiving port set.
+ */
+#define RTL8372N_VLAN_CTRL_REG			0x4e14
+#define RTL8372N_VLAN_CTRL_FILTER		BIT(2)
+#define RTL8372N_VLAN_INGRESS_FILTER_REG	0x4e18
+/* Per egress port: the ingress ports whose frames the port sends without
+ * checking its VLAN membership
+ */
+#define RTL8372N_VLAN_EGRESS_FREE_REG(port)	(0x4eb8 + ((port) / 3) * 4)
+#define RTL8372N_VLAN_EGRESS_FREE(port)		(GENMASK(9, 0) << (((port) % 3) * 10))
+
+/* How a port sends the VLAN tag of a frame: as the VLAN table says, or as
+ * the frame was received (the reset value)
+ */
+#define RTL8372N_VLAN_EGRESS_TAG_REG		0x6738
+#define RTL8372N_VLAN_EGRESS_TAG(port)		(GENMASK(1, 0) << ((port) * 2))
+#define RTL8372N_VLAN_EGRESS_TAG_TABLE		0
+#define RTL8372N_VLAN_EGRESS_TAG_KEEP		3
+
+/* Per egress port: the ingress ports whose frames leave the port as they
+ * were received, whatever its egress tag mode
+ */
+#define RTL8372N_VLAN_EGRESS_KEEP_REG(port)	(0x6728 + ((port) / 3) * 4)
+#define RTL8372N_VLAN_EGRESS_KEEP(port)		(GENMASK(9, 0) << (((port) % 3) * 10))
+
 /* How a read command searches the address table, and its result */
 #define RTL8372N_L2_LOOKUP_REG			0x5cb0
 #define RTL8372N_L2_LOOKUP_PORT			GENMASK(22, 19)
@@ -261,6 +292,7 @@ struct rtl8372n {
 	struct mutex tbl_lock;		/* table access sequences (0x5cac-0x5cd4) */
 	u32 chip_ver;
 	struct rtl8372n_pcs pcs[2];	/* one per SerDes */
+	u16 pvid[RTL8372N_NUM_PORTS];	/* the bridge's PVID, 0 = none (rtnl) */
 };
 
 /* Wait until the SerDes access unit has finished its last command */
@@ -767,6 +799,7 @@ static int rtl8372n_setup_isolation(struct realtek_priv *priv)
 static int rtl8372n_setup_cpu_port(struct realtek_priv *priv)
 {
 	u32 cpu_ports = dsa_cpu_ports(&priv->ds);
+	struct dsa_port *dp;
 	int cpu, ret;
 
 	if (hweight32(cpu_ports) != 1) {
@@ -790,8 +823,52 @@ static int rtl8372n_setup_cpu_port(struct realtek_priv *priv)
 	if (ret)
 		return ret;
 
-	return regmap_update_bits(priv->map, RTL8372N_CPU_TAG_AWARE_REG,
-				  BIT(cpu), BIT(cpu));
+	ret = regmap_update_bits(priv->map, RTL8372N_CPU_TAG_AWARE_REG,
+				 BIT(cpu), BIT(cpu));
+	if (ret)
+		return ret;
+
+	/* The bridge already gave each frame it sends the tag of the port */
+	dsa_switch_for_each_user_port(dp, &priv->ds) {
+		ret = regmap_update_bits(priv->map,
+					 RTL8372N_VLAN_EGRESS_KEEP_REG(dp->index),
+					 RTL8372N_VLAN_EGRESS_KEEP(dp->index),
+					 field_prep(RTL8372N_VLAN_EGRESS_KEEP(dp->index),
+						    BIT(cpu)));
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+/* Turn the VLAN membership check on, with every port exempt from it, and
+ * give untagged frames no VLAN. port_vlan_filtering applies the check and
+ * the PVID to the ports of a VLAN-filtering bridge.
+ */
+static int rtl8372n_setup_vlan(struct realtek_priv *priv)
+{
+	struct dsa_port *dp;
+	int ret;
+
+	dsa_switch_for_each_port(dp, &priv->ds) {
+		ret = regmap_update_bits(priv->map,
+					 RTL8372N_VLAN_PVID_REG(dp->index),
+					 RTL8372N_VLAN_PVID(dp->index), 0);
+		if (ret)
+			return ret;
+
+		ret = regmap_update_bits(priv->map,
+					 RTL8372N_VLAN_EGRESS_FREE_REG(dp->index),
+					 RTL8372N_VLAN_EGRESS_FREE(dp->index),
+					 RTL8372N_VLAN_EGRESS_FREE(dp->index));
+		if (ret)
+			return ret;
+	}
+
+	return regmap_update_bits(priv->map, RTL8372N_VLAN_CTRL_REG,
+				  RTL8372N_VLAN_CTRL_FILTER,
+				  RTL8372N_VLAN_CTRL_FILTER);
 }
 
 static int rtl8372n_setup_learning(struct realtek_priv *priv)
@@ -868,6 +945,12 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	ret = rtl8372n_setup_cpu_port(priv);
 	if (ret) {
 		dev_err(ds->dev, "CPU port setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_vlan(priv);
+	if (ret) {
+		dev_err(ds->dev, "VLAN setup failed: %pe\n", ERR_PTR(ret));
 		return ret;
 	}
 
@@ -1176,22 +1259,16 @@ static int rtl8372n_vlan_set_port(struct realtek_priv *priv, u16 vid, int port,
 	return rtl8372n_vlan_write(priv, vid, val);
 }
 
-static int rtl8372n_get_pvid(struct realtek_priv *priv, int port, u16 *vid)
+/* Untagged frames go to the bridge's PVID only while the port filters by
+ * VLAN. Otherwise they get no VLAN, and their addresses are keyed by the
+ * filtering ID of the port.
+ */
+static int rtl8372n_apply_pvid(struct realtek_priv *priv, int port,
+			       bool vlan_filtering)
 {
-	u32 val;
-	int ret;
+	struct rtl8372n *chip = priv->chip_data;
+	u16 vid = vlan_filtering ? chip->pvid[port] : 0;
 
-	ret = regmap_read(priv->map, RTL8372N_VLAN_PVID_REG(port), &val);
-	if (ret)
-		return ret;
-
-	*vid = field_get(RTL8372N_VLAN_PVID(port), val);
-
-	return 0;
-}
-
-static int rtl8372n_set_pvid(struct realtek_priv *priv, int port, u16 vid)
-{
 	return regmap_update_bits(priv->map, RTL8372N_VLAN_PVID_REG(port),
 				  RTL8372N_VLAN_PVID(port),
 				  field_prep(RTL8372N_VLAN_PVID(port), vid));
@@ -1666,19 +1743,6 @@ static int rtl8372n_port_fdb_del(struct dsa_switch *ds, int port,
 	return rtl8372n_l2_del(ds->priv, key);
 }
 
-/* Untagged frames that arrive on the port no longer go to the VLAN */
-static int rtl8372n_drop_pvid(struct realtek_priv *priv, int port, u16 vid)
-{
-	u16 pvid;
-	int ret;
-
-	ret = rtl8372n_get_pvid(priv, port, &pvid);
-	if (ret || pvid != vid)
-		return ret;
-
-	return rtl8372n_set_pvid(priv, port, 0);
-}
-
 static int rtl8372n_port_vlan_add(struct dsa_switch *ds, int port,
 				  const struct switchdev_obj_port_vlan *vlan,
 				  struct netlink_ext_ack *extack)
@@ -1686,29 +1750,76 @@ static int rtl8372n_port_vlan_add(struct dsa_switch *ds, int port,
 	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
 	bool pvid = vlan->flags & BRIDGE_VLAN_INFO_PVID;
 	struct realtek_priv *priv = ds->priv;
+	struct rtl8372n *chip;
 	int ret;
 
 	ret = rtl8372n_vlan_set_port(priv, vlan->vid, port, true, untagged);
 	if (ret)
 		return ret;
 
+	chip = priv->chip_data;
 	if (pvid)
-		return rtl8372n_set_pvid(priv, port, vlan->vid);
+		chip->pvid[port] = vlan->vid;
+	else if (chip->pvid[port] == vlan->vid)
+		chip->pvid[port] = 0;
 
-	return rtl8372n_drop_pvid(priv, port, vlan->vid);
+	return rtl8372n_apply_pvid(priv, port,
+				   dsa_port_is_vlan_filtering(dsa_to_port(ds, port)));
 }
 
 static int rtl8372n_port_vlan_del(struct dsa_switch *ds, int port,
 				  const struct switchdev_obj_port_vlan *vlan)
 {
 	struct realtek_priv *priv = ds->priv;
+	struct rtl8372n *chip;
 	int ret;
 
 	ret = rtl8372n_vlan_set_port(priv, vlan->vid, port, false, false);
 	if (ret)
 		return ret;
 
-	return rtl8372n_drop_pvid(priv, port, vlan->vid);
+	chip = priv->chip_data;
+	if (chip->pvid[port] == vlan->vid)
+		chip->pvid[port] = 0;
+
+	return rtl8372n_apply_pvid(priv, port,
+				   dsa_port_is_vlan_filtering(dsa_to_port(ds, port)));
+}
+
+/* A port of a VLAN-filtering bridge takes and sends only frames of its VLANs,
+ * and tags them as the VLAN table says. Otherwise it forwards frames of all
+ * VLANs and sends them as received. The CPU port stays exempt and keeps the
+ * reset mode, so frames reach the CPU as they arrived.
+ */
+static int rtl8372n_port_vlan_filtering(struct dsa_switch *ds, int port,
+					bool vlan_filtering,
+					struct netlink_ext_ack *extack)
+{
+	struct realtek_priv *priv = ds->priv;
+	u32 mode;
+	int ret;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_VLAN_INGRESS_FILTER_REG,
+				 BIT(port), vlan_filtering ? BIT(port) : 0);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_VLAN_EGRESS_FREE_REG(port),
+				 RTL8372N_VLAN_EGRESS_FREE(port),
+				 vlan_filtering ? 0 : RTL8372N_VLAN_EGRESS_FREE(port));
+	if (ret)
+		return ret;
+
+	mode = vlan_filtering ? RTL8372N_VLAN_EGRESS_TAG_TABLE :
+				RTL8372N_VLAN_EGRESS_TAG_KEEP;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_VLAN_EGRESS_TAG_REG,
+				 RTL8372N_VLAN_EGRESS_TAG(port),
+				 field_prep(RTL8372N_VLAN_EGRESS_TAG(port), mode));
+	if (ret)
+		return ret;
+
+	return rtl8372n_apply_pvid(priv, port, vlan_filtering);
 }
 
 static const struct dsa_switch_ops rtl8372n_switch_ops = {
@@ -1722,6 +1833,7 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_fdb_add = rtl8372n_port_fdb_add,
 	.port_fdb_del = rtl8372n_port_fdb_del,
 	.port_fdb_dump = rtl8372n_port_fdb_dump,
+	.port_vlan_filtering = rtl8372n_port_vlan_filtering,
 	.port_vlan_add = rtl8372n_port_vlan_add,
 	.port_vlan_del = rtl8372n_port_vlan_del,
 	.port_bridge_join = rtl83xx_port_bridge_join,
