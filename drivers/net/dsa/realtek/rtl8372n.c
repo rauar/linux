@@ -61,6 +61,11 @@
 #define RTL8372N_PORT_MAX_LEN_GE	GENMASK(27, 14)
 #define RTL8372N_PORT_MAX_LEN_MAX	0x3fff
 
+/* Energy-Efficient Ethernet per port and direction */
+#define RTL8372N_PORT_EEE_REG(port)	(0x125c + (port) * 0x100)
+#define RTL8372N_PORT_EEE_RX_EN		BIT(0)
+#define RTL8372N_PORT_EEE_TX_EN		BIT(1)
+
 /* MIB counters: a command selects port and counter, then the value is read */
 #define RTL8372N_MIB_CMD_REG		0x0f60
 #define RTL8372N_MIB_CMD_BUSY		BIT(0)
@@ -1042,6 +1047,24 @@ static int rtl8372n_setup_igmp(struct realtek_priv *priv)
 	return 0;
 }
 
+/* Energy-Efficient Ethernet stays off until phylink switches it on for a link */
+static int rtl8372n_setup_eee(struct realtek_priv *priv)
+{
+	struct dsa_port *dp;
+	int ret;
+
+	dsa_switch_for_each_port(dp, &priv->ds) {
+		ret = regmap_update_bits(priv->map,
+					 RTL8372N_PORT_EEE_REG(dp->index),
+					 RTL8372N_PORT_EEE_RX_EN |
+					 RTL8372N_PORT_EEE_TX_EN, 0);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int rtl8372n_setup_polling(struct realtek_priv *priv)
 {
 	int ret;
@@ -1127,6 +1150,12 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 		return ret;
 	}
 
+	ret = rtl8372n_setup_eee(priv);
+	if (ret) {
+		dev_err(ds->dev, "EEE setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
 	ret = rtl8372n_setup_polling(priv);
 	if (ret) {
 		dev_err(ds->dev, "polling setup failed: %pe\n", ERR_PTR(ret));
@@ -1162,6 +1191,9 @@ static void rtl8372n_phylink_get_caps(struct dsa_switch *ds, int port,
 		config->mac_capabilities = MAC_10 | MAC_100 | MAC_1000FD |
 					   MAC_2500FD | MAC_SYM_PAUSE |
 					   MAC_ASYM_PAUSE;
+		__set_bit(PHY_INTERFACE_MODE_INTERNAL, config->lpi_interfaces);
+		config->lpi_capabilities = MAC_100FD | MAC_1000FD |
+					   MAC_2500FD;
 	} else if (rtl8372n_is_serdes_port(port)) {
 		__set_bit(PHY_INTERFACE_MODE_10GBASER,
 			  config->supported_interfaces);
@@ -1207,11 +1239,36 @@ static void rtl8372n_mac_link_up(struct phylink_config *config,
 {
 }
 
+static void rtl8372n_mac_disable_tx_lpi(struct phylink_config *config)
+{
+	struct dsa_port *dp = dsa_phylink_to_port(config);
+	struct realtek_priv *priv = dp->ds->priv;
+
+	regmap_update_bits(priv->map, RTL8372N_PORT_EEE_REG(dp->index),
+			   RTL8372N_PORT_EEE_RX_EN | RTL8372N_PORT_EEE_TX_EN,
+			   0);
+}
+
+static int rtl8372n_mac_enable_tx_lpi(struct phylink_config *config, u32 timer,
+				      bool tx_clock_stop)
+{
+	struct dsa_port *dp = dsa_phylink_to_port(config);
+	struct realtek_priv *priv = dp->ds->priv;
+
+	return regmap_update_bits(priv->map, RTL8372N_PORT_EEE_REG(dp->index),
+				  RTL8372N_PORT_EEE_RX_EN |
+				  RTL8372N_PORT_EEE_TX_EN,
+				  RTL8372N_PORT_EEE_RX_EN |
+				  RTL8372N_PORT_EEE_TX_EN);
+}
+
 static const struct phylink_mac_ops rtl8372n_phylink_mac_ops = {
 	.mac_select_pcs = rtl8372n_mac_select_pcs,
 	.mac_config = rtl8372n_mac_config,
 	.mac_link_down = rtl8372n_mac_link_down,
 	.mac_link_up = rtl8372n_mac_link_up,
+	.mac_disable_tx_lpi = rtl8372n_mac_disable_tx_lpi,
+	.mac_enable_tx_lpi = rtl8372n_mac_enable_tx_lpi,
 };
 
 static int rtl8372n_port_enable(struct dsa_switch *ds, int port,
@@ -2383,6 +2440,23 @@ static int rtl8372n_port_vlan_filtering(struct dsa_switch *ds, int port,
 	return rtl8372n_apply_pvid(priv, port, vlan_filtering);
 }
 
+static bool rtl8372n_support_eee(struct dsa_switch *ds, int port)
+{
+	return rtl8372n_has_internal_phy(port);
+}
+
+static int rtl8372n_set_mac_eee(struct dsa_switch *ds, int port,
+				struct ethtool_keee *e)
+{
+	/* The driver knows no setting for the time a port waits before it
+	 * enters low power idle
+	 */
+	if (e->tx_lpi_timer)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.get_tag_protocol = rtl8372n_get_tag_protocol,
 	.connect_tag_protocol = rtl8372n_connect_tag_protocol,
@@ -2402,6 +2476,8 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_vlan_filtering = rtl8372n_port_vlan_filtering,
 	.port_vlan_add = rtl8372n_port_vlan_add,
 	.port_vlan_del = rtl8372n_port_vlan_del,
+	.support_eee = rtl8372n_support_eee,
+	.set_mac_eee = rtl8372n_set_mac_eee,
 	.port_bridge_join = rtl83xx_port_bridge_join,
 	.port_bridge_leave = rtl83xx_port_bridge_leave,
 	.port_change_mtu = rtl8372n_port_change_mtu,
