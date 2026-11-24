@@ -895,9 +895,11 @@ static int rtl8372n_port_enable(struct dsa_switch *ds, int port,
 	if (!dsa_is_user_port(ds, port))
 		return 0;
 
-	/* The port forwards to the CPU port only, and the CPU port to it */
-	ret = regmap_write(priv->map, RTL8372N_PORT_ISOLATION_REG(port),
-			   BIT(cpu));
+	/* Open the path between the port and the CPU port. The other bits of
+	 * the port's mask belong to the bridge the port may be in.
+	 */
+	ret = regmap_update_bits(priv->map, RTL8372N_PORT_ISOLATION_REG(port),
+				 BIT(cpu), BIT(cpu));
 	if (ret)
 		return ret;
 
@@ -914,7 +916,8 @@ static void rtl8372n_port_disable(struct dsa_switch *ds, int port)
 	if (!dsa_is_user_port(ds, port))
 		return;
 
-	ret = regmap_write(priv->map, RTL8372N_PORT_ISOLATION_REG(port), 0);
+	ret = regmap_update_bits(priv->map, RTL8372N_PORT_ISOLATION_REG(port),
+				 BIT(cpu), 0);
 	if (!ret)
 		ret = regmap_update_bits(priv->map,
 					 RTL8372N_PORT_ISOLATION_REG(cpu),
@@ -922,6 +925,20 @@ static void rtl8372n_port_disable(struct dsa_switch *ds, int port)
 	if (ret)
 		dev_err(priv->dev, "cannot isolate port %d: %pe\n", port,
 			ERR_PTR(ret));
+}
+
+static int rtl8372n_port_add_isolation(struct realtek_priv *priv, int port,
+				       u32 mask)
+{
+	return regmap_update_bits(priv->map, RTL8372N_PORT_ISOLATION_REG(port),
+				  mask, mask);
+}
+
+static int rtl8372n_port_remove_isolation(struct realtek_priv *priv, int port,
+					  u32 mask)
+{
+	return regmap_update_bits(priv->map, RTL8372N_PORT_ISOLATION_REG(port),
+				  mask, 0);
 }
 
 static void rtl8372n_port_stp_state_set(struct dsa_switch *ds, int port,
@@ -1105,6 +1122,8 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_enable = rtl8372n_port_enable,
 	.port_disable = rtl8372n_port_disable,
 	.port_stp_state_set = rtl8372n_port_stp_state_set,
+	.port_bridge_join = rtl83xx_port_bridge_join,
+	.port_bridge_leave = rtl83xx_port_bridge_leave,
 	.port_change_mtu = rtl8372n_port_change_mtu,
 	.port_max_mtu = rtl8372n_port_max_mtu,
 	.get_eth_mac_stats = rtl8372n_get_eth_mac_stats,
@@ -1188,6 +1207,8 @@ static const struct realtek_ops rtl8372n_ops = {
 	.detect = rtl8372n_detect,
 	.phy_read_c45 = rtl8372n_phy_read_c45,
 	.phy_write_c45 = rtl8372n_phy_write_c45,
+	.port_add_isolation = rtl8372n_port_add_isolation,
+	.port_remove_isolation = rtl8372n_port_remove_isolation,
 };
 
 static const struct realtek_variant rtl8372n_variant = {
