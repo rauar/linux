@@ -142,6 +142,13 @@
 #define RTL8372N_VLAN_EGRESS_FREE_REG(port)	(0x4eb8 + ((port) / 3) * 4)
 #define RTL8372N_VLAN_EGRESS_FREE(port)		(GENMASK(9, 0) << (((port) % 3) * 10))
 
+/* Ports with a filtering ID of their own. It is the key of their addresses
+ * in frames without a VLAN or in a VLAN without independent learning.
+ */
+#define RTL8372N_PORT_FID_EN_REG		0x4e38
+#define RTL8372N_PORT_FID_REG(port)		(0x4e3c + ((port) / 8) * 4)
+#define RTL8372N_PORT_FID(port)			(GENMASK(3, 0) << (((port) % 8) * 4))
+
 /* How a port sends the VLAN tag of a frame: as the VLAN table says, or as
  * the frame was received (the reset value)
  */
@@ -930,6 +937,9 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	struct realtek_priv *priv = ds->priv;
 	int ret;
 
+	/* Bridge numbers are the filtering IDs 1 to 15, 0 is standalone */
+	ds->max_num_bridges = FIELD_MAX(RTL8372N_PORT_FID(0));
+
 	ret = rtl8372n_soft_reset(priv);
 	if (ret) {
 		dev_err(ds->dev, "soft reset failed: %pe\n", ERR_PTR(ret));
@@ -1094,6 +1104,25 @@ static int rtl8372n_port_remove_isolation(struct realtek_priv *priv, int port,
 {
 	return regmap_update_bits(priv->map, RTL8372N_PORT_ISOLATION_REG(port),
 				  mask, 0);
+}
+
+/* A bridged port gets the bridge number as its filtering ID, so bridges that
+ * do not filter by VLAN keep their addresses apart. A standalone port (0)
+ * uses filtering ID 0.
+ */
+static int rtl8372n_port_set_efid(struct realtek_priv *priv, int port,
+				  u32 efid)
+{
+	int ret;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_PORT_FID_REG(port),
+				 RTL8372N_PORT_FID(port),
+				 field_prep(RTL8372N_PORT_FID(port), efid));
+	if (ret)
+		return ret;
+
+	return regmap_update_bits(priv->map, RTL8372N_PORT_FID_EN_REG,
+				  BIT(port), efid ? BIT(port) : 0);
 }
 
 /* Ports learn addresses only while they are in a bridge */
@@ -1927,6 +1956,7 @@ static const struct realtek_ops rtl8372n_ops = {
 	.phy_write_c45 = rtl8372n_phy_write_c45,
 	.port_add_isolation = rtl8372n_port_add_isolation,
 	.port_remove_isolation = rtl8372n_port_remove_isolation,
+	.port_set_efid = rtl8372n_port_set_efid,
 	.port_set_learning = rtl8372n_port_set_learning,
 };
 
