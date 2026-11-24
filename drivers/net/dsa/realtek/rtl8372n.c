@@ -939,6 +939,7 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 
 	/* Bridge numbers are the filtering IDs 1 to 15, 0 is standalone */
 	ds->max_num_bridges = FIELD_MAX(RTL8372N_PORT_FID(0));
+	ds->fdb_isolation = true;
 
 	ret = rtl8372n_soft_reset(priv);
 	if (ret) {
@@ -1507,6 +1508,7 @@ out:
 static int rtl8372n_port_fdb_dump(struct dsa_switch *ds, int port,
 				  dsa_fdb_dump_cb_t *cb, void *data)
 {
+	unsigned int fid = dsa_port_bridge_num_get(dsa_to_port(ds, port));
 	struct realtek_priv *priv = ds->priv;
 	u32 entry[RTL8372N_L2_ENTRY_WORDS];
 	u8 addr[ETH_ALEN];
@@ -1531,15 +1533,19 @@ static int rtl8372n_port_fdb_dump(struct dsa_switch *ds, int port,
 					     entry[1]), &addr[0]);
 		put_unaligned_be32(entry[0], &addr[2]);
 
-		vid = 0;
-		if (entry[1] & RTL8372N_L2_UC_D1_IVL)
-			vid = FIELD_GET(RTL8372N_L2_UC_D1_VID, entry[1]);
+		index = found + 1;
+
+		/* Without a VLAN, report only the entries of the port's bridge */
+		vid = FIELD_GET(RTL8372N_L2_UC_D1_VID, entry[1]);
+		if (!(entry[1] & RTL8372N_L2_UC_D1_IVL)) {
+			if (vid != fid)
+				continue;
+			vid = 0;
+		}
 
 		ret = cb(addr, vid, entry[2] & RTL8372N_L2_UC_D2_STATIC, data);
 		if (ret)
 			return ret;
-
-		index = found + 1;
 	}
 
 	return 0;
@@ -1720,13 +1726,25 @@ static void rtl8372n_get_eth_mac_stats(struct dsa_switch *ds, int port,
 }
 
 /* The words of a static entry for an address on a port. Like the entries the
- * switch learns, it has the filtering ID 0.
+ * switch learns, an entry for a VLAN is keyed by the VLAN ID and any other by
+ * the filtering ID of the bridge (0 outside a bridge).
  */
-static void rtl8372n_l2_pack(const unsigned char *addr, int port, u32 *data)
+static void rtl8372n_l2_pack(const unsigned char *addr, int port, u16 vid,
+			     struct dsa_db db, u32 *data)
 {
+	u32 key;
+
+	if (vid)
+		key = FIELD_PREP(RTL8372N_L2_UC_D1_VID, vid) |
+		      RTL8372N_L2_UC_D1_IVL;
+	else if (db.type == DSA_DB_BRIDGE)
+		key = FIELD_PREP(RTL8372N_L2_UC_D1_VID, db.bridge.num);
+	else
+		key = 0;
+
 	data[0] = get_unaligned_be32(&addr[2]);
 	data[1] = FIELD_PREP(RTL8372N_L2_UC_D1_MAC_HI,
-			     get_unaligned_be16(&addr[0])) |
+			     get_unaligned_be16(&addr[0])) | key |
 		  FIELD_PREP(RTL8372N_L2_UC_D1_PORT_LO, port & 0x3);
 	data[2] = FIELD_PREP(RTL8372N_L2_UC_D2_PORT_HI, port >> 2) |
 		  FIELD_PREP(RTL8372N_L2_UC_D2_AGE,
@@ -1740,13 +1758,7 @@ static int rtl8372n_port_fdb_add(struct dsa_switch *ds, int port,
 {
 	u32 data[RTL8372N_L2_ENTRY_WORDS];
 
-	/* The address table is not VLAN aware yet. The bridge has an entry
-	 * without VLAN next to each of its entries with a VLAN.
-	 */
-	if (vid)
-		return 0;
-
-	rtl8372n_l2_pack(addr, port, data);
+	rtl8372n_l2_pack(addr, port, vid, db, data);
 
 	return rtl8372n_l2_write(ds->priv, data);
 }
@@ -1757,17 +1769,14 @@ static int rtl8372n_port_fdb_del(struct dsa_switch *ds, int port,
 {
 	u32 key[RTL8372N_L2_ENTRY_WORDS];
 
-	if (vid)
-		return 0;
-
-	/* All bridges share the one table of the switch: keep an address of
-	 * the CPU port that another bridge still has
+	/* Bridges that filter by VLAN share the entries of a VLAN: keep an
+	 * address of the CPU port that another bridge still has
 	 */
-	if (dsa_is_cpu_port(ds, port) &&
+	if (vid && dsa_is_cpu_port(ds, port) &&
 	    dsa_fdb_present_in_other_db(ds, port, addr, vid, db))
 		return 0;
 
-	rtl8372n_l2_pack(addr, port, key);
+	rtl8372n_l2_pack(addr, port, vid, db, key);
 
 	return rtl8372n_l2_del(ds->priv, key);
 }
