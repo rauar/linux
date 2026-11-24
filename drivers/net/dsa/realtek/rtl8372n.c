@@ -1910,10 +1910,16 @@ enum {
 	RTL8372N_MIB_RX_CRC_ERR,
 	RTL8372N_MIB_TX_GOOD,
 	RTL8372N_MIB_RX_GOOD,
-	RTL8372N_MIB_NUM
+	RTL8372N_MIB_NUM,
+	/* Read one at a time, not with the MAC statistics */
+	RTL8372N_MIB_SYMBOL_ERR = RTL8372N_MIB_NUM,
+	RTL8372N_MIB_IN_UNKNOWN_OPCODE,
+	RTL8372N_MIB_IN_PAUSE,
+	RTL8372N_MIB_OUT_PAUSE,
+	RTL8372N_MIB_ALL
 };
 
-static const struct rtl8372n_mib rtl8372n_mibs[RTL8372N_MIB_NUM] = {
+static const struct rtl8372n_mib rtl8372n_mibs[RTL8372N_MIB_ALL] = {
 	[RTL8372N_MIB_IN_OCTETS]	= {  0, 2 },
 	[RTL8372N_MIB_OUT_OCTETS]	= {  2, 2 },
 	[RTL8372N_MIB_IN_MCAST]		= {  6, 2 },
@@ -1928,6 +1934,10 @@ static const struct rtl8372n_mib rtl8372n_mibs[RTL8372N_MIB_NUM] = {
 	[RTL8372N_MIB_RX_CRC_ERR]	= { 31, 1 },
 	[RTL8372N_MIB_TX_GOOD]		= { 92, 2 },
 	[RTL8372N_MIB_RX_GOOD]		= { 94, 2 },
+	[RTL8372N_MIB_SYMBOL_ERR]	= { 23, 1 },
+	[RTL8372N_MIB_IN_UNKNOWN_OPCODE] = { 24, 1 },
+	[RTL8372N_MIB_IN_PAUSE]		= { 25, 1 },
+	[RTL8372N_MIB_OUT_PAUSE]	= { 26, 1 },
 };
 
 static int rtl8372n_mib_read(struct realtek_priv *priv, int port,
@@ -1996,6 +2006,49 @@ static void rtl8372n_get_eth_mac_stats(struct dsa_switch *ds, int port,
 	mac_stats->FramesWithDeferredXmissions = cnt[RTL8372N_MIB_DEFERRED];
 	mac_stats->LateCollisions = cnt[RTL8372N_MIB_LATE_COLL];
 	mac_stats->FramesAbortedDueToXSColls = cnt[RTL8372N_MIB_EXCESS_COLL];
+}
+
+static int rtl8372n_mib_get(struct realtek_priv *priv, int port, int id,
+			    u64 *val)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	int ret;
+
+	mutex_lock(&chip->mib_lock);
+	ret = rtl8372n_mib_read(priv, port, &rtl8372n_mibs[id], val);
+	mutex_unlock(&chip->mib_lock);
+
+	return ret;
+}
+
+static void rtl8372n_get_eth_phy_stats(struct dsa_switch *ds, int port,
+				       struct ethtool_eth_phy_stats *phy_stats)
+{
+	u64 val;
+
+	if (!rtl8372n_mib_get(ds->priv, port, RTL8372N_MIB_SYMBOL_ERR, &val))
+		phy_stats->SymbolErrorDuringCarrier = val;
+}
+
+static void rtl8372n_get_eth_ctrl_stats(struct dsa_switch *ds, int port,
+					struct ethtool_eth_ctrl_stats *ctrl_stats)
+{
+	u64 val;
+
+	if (!rtl8372n_mib_get(ds->priv, port, RTL8372N_MIB_IN_UNKNOWN_OPCODE,
+			      &val))
+		ctrl_stats->UnsupportedOpcodesReceived = val;
+}
+
+static void rtl8372n_get_pause_stats(struct dsa_switch *ds, int port,
+				     struct ethtool_pause_stats *pause_stats)
+{
+	u64 val;
+
+	if (!rtl8372n_mib_get(ds->priv, port, RTL8372N_MIB_IN_PAUSE, &val))
+		pause_stats->rx_pause_frames = val;
+	if (!rtl8372n_mib_get(ds->priv, port, RTL8372N_MIB_OUT_PAUSE, &val))
+		pause_stats->tx_pause_frames = val;
 }
 
 /* The words of the key of an entry: the address and, like the entries the
@@ -2231,7 +2284,10 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_bridge_leave = rtl83xx_port_bridge_leave,
 	.port_change_mtu = rtl8372n_port_change_mtu,
 	.port_max_mtu = rtl8372n_port_max_mtu,
+	.get_eth_phy_stats = rtl8372n_get_eth_phy_stats,
 	.get_eth_mac_stats = rtl8372n_get_eth_mac_stats,
+	.get_eth_ctrl_stats = rtl8372n_get_eth_ctrl_stats,
+	.get_pause_stats = rtl8372n_get_pause_stats,
 };
 
 /*
