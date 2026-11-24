@@ -2104,6 +2104,75 @@ static void rtl8372n_get_rmon_stats(struct dsa_switch *ds, int port,
 	*ranges = rtl8372n_rmon_ranges;
 }
 
+/* Counters without a standard ethtool group, one word each */
+static const struct {
+	u8 word;
+	const char *name;
+} rtl8372n_stats[] = {
+	{ 16, "ifOutDiscards" },
+	{ 17, "dot1dTpPortInDiscards" },
+	{ 27, "etherStatsDropEvents" },
+	{ 67, "lengthFieldErrors" },
+	{ 68, "falseCarrierTimes" },
+	{ 70, "framingErrors" },
+	{ 72, "rxMacDiscards" },
+	{ 73, "rxMacIPGShortDrops" },
+	{ 75, "dot1dTpLearnedEntryDiscards" },
+	{ 76, "egrQueue7DropPkts" },
+	{ 77, "egrQueue6DropPkts" },
+	{ 78, "egrQueue5DropPkts" },
+	{ 79, "egrQueue4DropPkts" },
+	{ 80, "egrQueue3DropPkts" },
+	{ 81, "egrQueue2DropPkts" },
+	{ 82, "egrQueue1DropPkts" },
+	{ 83, "egrQueue0DropPkts" },
+	{ 84, "egrQueue7OutPkts" },
+	{ 85, "egrQueue6OutPkts" },
+	{ 86, "egrQueue5OutPkts" },
+	{ 87, "egrQueue4OutPkts" },
+	{ 88, "egrQueue3OutPkts" },
+	{ 89, "egrQueue2OutPkts" },
+	{ 90, "egrQueue1OutPkts" },
+	{ 91, "egrQueue0OutPkts" },
+	{ 96, "rxErrors" },
+	{ 97, "txErrors" },
+};
+
+static void rtl8372n_get_strings(struct dsa_switch *ds, int port, u32 stringset,
+				 uint8_t *data)
+{
+	int i;
+
+	if (stringset != ETH_SS_STATS)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(rtl8372n_stats); i++)
+		ethtool_puts(&data, rtl8372n_stats[i].name);
+}
+
+static int rtl8372n_get_sset_count(struct dsa_switch *ds, int port, int sset)
+{
+	return sset == ETH_SS_STATS ? ARRAY_SIZE(rtl8372n_stats) : 0;
+}
+
+static void rtl8372n_get_ethtool_stats(struct dsa_switch *ds, int port,
+				       uint64_t *data)
+{
+	struct rtl8372n_mib mib = { .words = 1 };
+	struct realtek_priv *priv = ds->priv;
+	struct rtl8372n *chip;
+	int i;
+
+	chip = priv->chip_data;
+	mutex_lock(&chip->mib_lock);
+	for (i = 0; i < ARRAY_SIZE(rtl8372n_stats); i++) {
+		mib.word = rtl8372n_stats[i].word;
+		if (rtl8372n_mib_read(priv, port, &mib, &data[i]))
+			break;
+	}
+	mutex_unlock(&chip->mib_lock);
+}
+
 /* The words of the key of an entry: the address and, like the entries the
  * switch learns, the VLAN ID for an entry of a VLAN and the filtering ID of
  * the bridge (0 outside a bridge) for any other
@@ -2337,6 +2406,9 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_bridge_leave = rtl83xx_port_bridge_leave,
 	.port_change_mtu = rtl8372n_port_change_mtu,
 	.port_max_mtu = rtl8372n_port_max_mtu,
+	.get_strings = rtl8372n_get_strings,
+	.get_ethtool_stats = rtl8372n_get_ethtool_stats,
+	.get_sset_count = rtl8372n_get_sset_count,
 	.get_eth_phy_stats = rtl8372n_get_eth_phy_stats,
 	.get_eth_mac_stats = rtl8372n_get_eth_mac_stats,
 	.get_eth_ctrl_stats = rtl8372n_get_eth_ctrl_stats,
