@@ -79,6 +79,18 @@
 
 #define RTL8372N_L2_LEARN_LIMIT_REG(port)	(0x5384 + (port) * 4)
 #define RTL8372N_L2_LEARN_LIMIT			GENMASK(12, 0)
+/* Size of the address table: a port with this limit learns without limit */
+#define RTL8372N_L2_TABLE_SIZE			4160
+
+/* Remove the learned addresses of the ports in the command */
+#define RTL8372N_L2_FLUSH_CMD_REG		0x53d4
+#define RTL8372N_L2_FLUSH_CMD_PORTS		GENMASK(9, 0)
+#define RTL8372N_L2_FLUSH_CMD_START		BIT(16)
+#define RTL8372N_L2_FLUSH_CMD_BUSY		BIT(17)
+
+#define RTL8372N_L2_FLUSH_MODE_REG		0x53dc
+#define RTL8372N_L2_FLUSH_MODE			GENMASK(1, 0)
+#define RTL8372N_L2_FLUSH_MODE_PORT		0
 
 #define RTL8372N_SDS_CMD_REG		0x03f8
 #define RTL8372N_SDS_CMD_INDEX		BIT(0)
@@ -941,6 +953,65 @@ static int rtl8372n_port_remove_isolation(struct realtek_priv *priv, int port,
 				  mask, 0);
 }
 
+/* Ports learn addresses only while they are in a bridge */
+static int rtl8372n_port_set_learning(struct realtek_priv *priv, int port,
+				      bool enable)
+{
+	u32 limit = enable ? RTL8372N_L2_TABLE_SIZE : 0;
+
+	return regmap_update_bits(priv->map, RTL8372N_L2_LEARN_LIMIT_REG(port),
+				  RTL8372N_L2_LEARN_LIMIT,
+				  FIELD_PREP(RTL8372N_L2_LEARN_LIMIT, limit));
+}
+
+static int rtl8372n_l2_flush_wait(struct realtek_priv *priv)
+{
+	u32 val;
+
+	return regmap_read_poll_timeout(priv->map, RTL8372N_L2_FLUSH_CMD_REG,
+					val,
+					!(val & RTL8372N_L2_FLUSH_CMD_BUSY),
+					100, 100 * USEC_PER_MSEC);
+}
+
+static void rtl8372n_port_fast_age(struct dsa_switch *ds, int port)
+{
+	struct realtek_priv *priv = ds->priv;
+	int ret;
+
+	ret = rtl8372n_l2_flush_wait(priv);
+	if (ret)
+		goto err;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_L2_FLUSH_MODE_REG,
+				 RTL8372N_L2_FLUSH_MODE,
+				 FIELD_PREP(RTL8372N_L2_FLUSH_MODE,
+					    RTL8372N_L2_FLUSH_MODE_PORT));
+	if (ret)
+		goto err;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_L2_FLUSH_CMD_REG,
+				 RTL8372N_L2_FLUSH_CMD_PORTS, BIT(port));
+	if (ret)
+		goto err;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_L2_FLUSH_CMD_REG,
+				 RTL8372N_L2_FLUSH_CMD_START,
+				 RTL8372N_L2_FLUSH_CMD_START);
+	if (ret)
+		goto err;
+
+	ret = rtl8372n_l2_flush_wait(priv);
+	if (ret)
+		goto err;
+
+	return;
+
+err:
+	dev_err(priv->dev, "cannot flush the addresses of port %d: %pe\n", port,
+		ERR_PTR(ret));
+}
+
 static void rtl8372n_port_stp_state_set(struct dsa_switch *ds, int port,
 					u8 state)
 {
@@ -1122,6 +1193,7 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_enable = rtl8372n_port_enable,
 	.port_disable = rtl8372n_port_disable,
 	.port_stp_state_set = rtl8372n_port_stp_state_set,
+	.port_fast_age = rtl8372n_port_fast_age,
 	.port_bridge_join = rtl83xx_port_bridge_join,
 	.port_bridge_leave = rtl83xx_port_bridge_leave,
 	.port_change_mtu = rtl8372n_port_change_mtu,
@@ -1209,6 +1281,7 @@ static const struct realtek_ops rtl8372n_ops = {
 	.phy_write_c45 = rtl8372n_phy_write_c45,
 	.port_add_isolation = rtl8372n_port_add_isolation,
 	.port_remove_isolation = rtl8372n_port_remove_isolation,
+	.port_set_learning = rtl8372n_port_set_learning,
 };
 
 static const struct realtek_variant rtl8372n_variant = {
