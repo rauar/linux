@@ -95,12 +95,13 @@
 #define RTL8372N_L2_FLUSH_MODE			GENMASK(1, 0)
 #define RTL8372N_L2_FLUSH_MODE_PORT		0
 
-/* Indirect access to the address table: a command register, and three data
- * words for an entry
+/* Indirect access to the tables of the switch: a command register, and data
+ * words for an entry (three for the address table, one for the VLAN table)
  */
 #define RTL8372N_TBL_CMD_REG			0x5cac
 #define RTL8372N_TBL_CMD_INDEX			GENMASK(28, 16)
 #define RTL8372N_TBL_CMD_TYPE			GENMASK(10, 8)
+#define RTL8372N_TBL_CMD_TYPE_VLAN		3
 #define RTL8372N_TBL_CMD_TYPE_L2		4
 #define RTL8372N_TBL_CMD_WRITE			BIT(1)
 /* Start bit, reads as 1 while the command runs */
@@ -109,6 +110,20 @@
 #define RTL8372N_TBL_WDATA_REG(i)		(0x5cb8 + (i) * 4)
 #define RTL8372N_TBL_RDATA_REG(i)		(0x5ccc + (i) * 4)
 #define RTL8372N_L2_ENTRY_WORDS			3
+
+/* VLAN entry: member ports, and the members that send the VLAN's frames
+ * without tag
+ */
+#define RTL8372N_VLAN_MEMBERS			GENMASK(9, 0)
+#define RTL8372N_VLAN_UNTAGGED			GENMASK(19, 10)
+/* Addresses in the VLAN are learned and looked up with the VLAN ID as key.
+ * Without it, the key is a filtering ID.
+ */
+#define RTL8372N_VLAN_IVL			BIT(25)
+
+/* VLAN of untagged frames that arrive on a port, 0 = none */
+#define RTL8372N_VLAN_PVID_REG(port)		(0x4e1c + ((port) / 2) * 4)
+#define RTL8372N_VLAN_PVID(port)		(GENMASK(11, 0) << (((port) % 2) * 12))
 
 /* How a read command searches the address table, and its result */
 #define RTL8372N_L2_LOOKUP_REG			0x5cb0
@@ -1066,6 +1081,122 @@ static int rtl8372n_tbl_wait(struct realtek_priv *priv)
 					100, 100 * USEC_PER_MSEC);
 }
 
+/* Read the entry of a VLAN from the VLAN table */
+static int rtl8372n_vlan_read(struct realtek_priv *priv, u16 vid, u32 *val)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	int ret;
+
+	mutex_lock(&chip->tbl_lock);
+
+	ret = rtl8372n_tbl_wait(priv);
+	if (ret)
+		goto out;
+
+	ret = regmap_write(priv->map, RTL8372N_TBL_CMD_REG,
+			   FIELD_PREP(RTL8372N_TBL_CMD_INDEX, vid) |
+			   FIELD_PREP(RTL8372N_TBL_CMD_TYPE,
+				      RTL8372N_TBL_CMD_TYPE_VLAN) |
+			   RTL8372N_TBL_CMD_EXEC);
+	if (ret)
+		goto out;
+
+	ret = rtl8372n_tbl_wait(priv);
+	if (ret)
+		goto out;
+
+	ret = regmap_read(priv->map, RTL8372N_TBL_RDATA_REG(0), val);
+
+out:
+	mutex_unlock(&chip->tbl_lock);
+
+	return ret;
+}
+
+/* Write the entry of a VLAN into the VLAN table */
+static int rtl8372n_vlan_write(struct realtek_priv *priv, u16 vid, u32 val)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	int ret;
+
+	mutex_lock(&chip->tbl_lock);
+
+	ret = rtl8372n_tbl_wait(priv);
+	if (ret)
+		goto out;
+
+	ret = regmap_write(priv->map, RTL8372N_TBL_WDATA_REG(0), val);
+	if (ret)
+		goto out;
+
+	ret = regmap_write(priv->map, RTL8372N_TBL_CMD_REG,
+			   FIELD_PREP(RTL8372N_TBL_CMD_INDEX, vid) |
+			   FIELD_PREP(RTL8372N_TBL_CMD_TYPE,
+				      RTL8372N_TBL_CMD_TYPE_VLAN) |
+			   RTL8372N_TBL_CMD_WRITE | RTL8372N_TBL_CMD_EXEC);
+	if (ret)
+		goto out;
+
+	ret = rtl8372n_tbl_wait(priv);
+
+out:
+	mutex_unlock(&chip->tbl_lock);
+
+	return ret;
+}
+
+/* Make a port a member of a VLAN, tagged or untagged, or remove it. The
+ * caller serializes the changes of the VLAN table (rtnl).
+ */
+static int rtl8372n_vlan_set_port(struct realtek_priv *priv, u16 vid, int port,
+				  bool member, bool untagged)
+{
+	u32 members, untag;
+	u32 val;
+	int ret;
+
+	ret = rtl8372n_vlan_read(priv, vid, &val);
+	if (ret)
+		return ret;
+
+	members = FIELD_GET(RTL8372N_VLAN_MEMBERS, val) & ~BIT(port);
+	untag = FIELD_GET(RTL8372N_VLAN_UNTAGGED, val) & ~BIT(port);
+	if (member)
+		members |= BIT(port);
+	if (member && untagged)
+		untag |= BIT(port);
+
+	val &= ~(RTL8372N_VLAN_MEMBERS | RTL8372N_VLAN_UNTAGGED |
+		 RTL8372N_VLAN_IVL);
+	if (members)
+		val |= FIELD_PREP(RTL8372N_VLAN_MEMBERS, members) |
+		       FIELD_PREP(RTL8372N_VLAN_UNTAGGED, untag) |
+		       RTL8372N_VLAN_IVL;
+
+	return rtl8372n_vlan_write(priv, vid, val);
+}
+
+static int rtl8372n_get_pvid(struct realtek_priv *priv, int port, u16 *vid)
+{
+	u32 val;
+	int ret;
+
+	ret = regmap_read(priv->map, RTL8372N_VLAN_PVID_REG(port), &val);
+	if (ret)
+		return ret;
+
+	*vid = field_get(RTL8372N_VLAN_PVID(port), val);
+
+	return 0;
+}
+
+static int rtl8372n_set_pvid(struct realtek_priv *priv, int port, u16 vid)
+{
+	return regmap_update_bits(priv->map, RTL8372N_VLAN_PVID_REG(port),
+				  RTL8372N_VLAN_PVID(port),
+				  field_prep(RTL8372N_VLAN_PVID(port), vid));
+}
+
 /* Read the first unicast entry of a port at or after *index. Returns -ENOENT
  * if there is none.
  */
@@ -1535,6 +1666,51 @@ static int rtl8372n_port_fdb_del(struct dsa_switch *ds, int port,
 	return rtl8372n_l2_del(ds->priv, key);
 }
 
+/* Untagged frames that arrive on the port no longer go to the VLAN */
+static int rtl8372n_drop_pvid(struct realtek_priv *priv, int port, u16 vid)
+{
+	u16 pvid;
+	int ret;
+
+	ret = rtl8372n_get_pvid(priv, port, &pvid);
+	if (ret || pvid != vid)
+		return ret;
+
+	return rtl8372n_set_pvid(priv, port, 0);
+}
+
+static int rtl8372n_port_vlan_add(struct dsa_switch *ds, int port,
+				  const struct switchdev_obj_port_vlan *vlan,
+				  struct netlink_ext_ack *extack)
+{
+	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
+	bool pvid = vlan->flags & BRIDGE_VLAN_INFO_PVID;
+	struct realtek_priv *priv = ds->priv;
+	int ret;
+
+	ret = rtl8372n_vlan_set_port(priv, vlan->vid, port, true, untagged);
+	if (ret)
+		return ret;
+
+	if (pvid)
+		return rtl8372n_set_pvid(priv, port, vlan->vid);
+
+	return rtl8372n_drop_pvid(priv, port, vlan->vid);
+}
+
+static int rtl8372n_port_vlan_del(struct dsa_switch *ds, int port,
+				  const struct switchdev_obj_port_vlan *vlan)
+{
+	struct realtek_priv *priv = ds->priv;
+	int ret;
+
+	ret = rtl8372n_vlan_set_port(priv, vlan->vid, port, false, false);
+	if (ret)
+		return ret;
+
+	return rtl8372n_drop_pvid(priv, port, vlan->vid);
+}
+
 static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.get_tag_protocol = rtl8372n_get_tag_protocol,
 	.setup = rtl8372n_setup,
@@ -1546,6 +1722,8 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_fdb_add = rtl8372n_port_fdb_add,
 	.port_fdb_del = rtl8372n_port_fdb_del,
 	.port_fdb_dump = rtl8372n_port_fdb_dump,
+	.port_vlan_add = rtl8372n_port_vlan_add,
+	.port_vlan_del = rtl8372n_port_vlan_del,
 	.port_bridge_join = rtl83xx_port_bridge_join,
 	.port_bridge_leave = rtl83xx_port_bridge_leave,
 	.port_change_mtu = rtl8372n_port_change_mtu,
