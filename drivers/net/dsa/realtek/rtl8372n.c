@@ -88,6 +88,15 @@
 #define RTL8372N_SDS_FRC_0		1
 #define RTL8372N_SDS_FRC_1		3
 
+/* Code the SerDes sends in its USXGMII negotiation word */
+#define RTL8372N_SDS_USX_AN_PAGE	0x07
+#define RTL8372N_SDS_USX_AN_REG		0x10
+#define RTL8372N_SDS_USX_AN_OPCODE	GENMASK(7, 0)
+#define RTL8372N_SDS_USX_AN_OPCODE_STD	0x03
+/* USXGMII negotiation on, one bit per channel of the SerDes */
+#define RTL8372N_SDS_USX_AN_EN_REG	0x11
+#define RTL8372N_SDS_USX_AN_EN		GENMASK(3, 0)
+
 #define RTL8372N_SDS_MODE_REG		0x7b20
 #define RTL8372N_SDS_MODE_SDS0		GENMASK(4, 0)
 #define RTL8372N_SDS_MODE_SDS1		GENMASK(9, 5)
@@ -95,6 +104,7 @@
 #define RTL8372N_SDS_MODE_SDS1_USX_SUB	GENMASK(20, 16)
 #define RTL8372N_SDS_MODE_MAC3_8221B	BIT(21)
 #define RTL8372N_SDS_MODE_MAC8_8221B	BIT(22)
+#define RTL8372N_SDS_MODE_USXGMII	0x0d
 #define RTL8372N_SDS_MODE_10GBASER	0x1a
 
 #define RTL8372N_CHIP_INFO_REG		0x000c
@@ -128,6 +138,16 @@
 
 #define RTL8372N_SERDES_PORTS		(BIT(3) | BIT(8))
 #define RTL8372N_LINK_STATUS_REG	0x63e8	/* link up, one bit per port */
+/* Speed of a port, four bits per port */
+#define RTL8372N_SPEED_STATUS_REG(port)	(0x63f0 + ((port) / 8) * 4)
+#define RTL8372N_SPEED_STATUS(port)	(GENMASK(3, 0) << (((port) % 8) * 4))
+#define RTL8372N_SPEED_STATUS_10	0
+#define RTL8372N_SPEED_STATUS_100	1
+#define RTL8372N_SPEED_STATUS_1000	2
+#define RTL8372N_SPEED_STATUS_10000	4
+#define RTL8372N_SPEED_STATUS_2500	5
+#define RTL8372N_SPEED_STATUS_5000	6
+#define RTL8372N_DUPLEX_STATUS_REG	0x63f8	/* full duplex, one bit per port */
 #define RTL8372N_INT_PHY_PORTS		GENMASK(7, 4)
 
 #define RTL8372N_NUM_PORTS		9
@@ -379,6 +399,32 @@ static int rtl8372n_sds_tune_10g(struct realtek_priv *priv, int sds)
 				       ARRAY_SIZE(rtl8372n_sds_mac));
 }
 
+/* Vendor values that change a SerDes in USXGMII mode from Realtek's variant of
+ * USXGMII, the reset default, to the standard one; meaning undocumented
+ */
+static const struct rtl8372n_sds_reg rtl8372n_sds_usxgmii_std[] = {
+	{ 0x06, 0x0d, 0x0f00 }, { 0x06, 0x1d, 0x0600 }, { 0x07, 0x06, 0x1401 },
+	{ 0x07, 0x08, 0x1401 }, { 0x07, 0x0a, 0x1401 }, { 0x07, 0x0c, 0x1401 },
+	{ 0x06, 0x12, 0x00a4 }, { 0x06, 0x13, 0x0000 }, { 0x06, 0x14, 0x0000 },
+	{ 0x06, 0x15, 0x0000 }, { 0x06, 0x16, 0x0000 }, { 0x06, 0x17, 0x0000 },
+	{ 0x06, 0x18, 0x0000 },
+};
+
+static int rtl8372n_sds_usxgmii_standard(struct realtek_priv *priv, int sds)
+{
+	int ret;
+
+	ret = rtl8372n_sds_write_regs(priv, sds, rtl8372n_sds_usxgmii_std,
+				      ARRAY_SIZE(rtl8372n_sds_usxgmii_std));
+	if (ret)
+		return ret;
+
+	return rtl8372n_sds_update_bits(priv, sds, RTL8372N_SDS_USX_AN_PAGE,
+					RTL8372N_SDS_USX_AN_REG,
+					RTL8372N_SDS_USX_AN_OPCODE,
+					RTL8372N_SDS_USX_AN_OPCODE_STD);
+}
+
 static struct rtl8372n_pcs *to_rtl8372n_pcs(struct phylink_pcs *pcs)
 {
 	return container_of(pcs, struct rtl8372n_pcs, pcs);
@@ -391,20 +437,45 @@ static int rtl8372n_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 {
 	struct rtl8372n_pcs *rpcs = to_rtl8372n_pcs(pcs);
 	struct realtek_priv *priv = rpcs->priv;
+	u32 mode;
 	int ret;
 
-	if (interface != PHY_INTERFACE_MODE_10GBASER)
+	switch (interface) {
+	case PHY_INTERFACE_MODE_10GBASER:
+		mode = RTL8372N_SDS_MODE_10GBASER;
+		break;
+	case PHY_INTERFACE_MODE_USXGMII:
+		mode = RTL8372N_SDS_MODE_USXGMII;
+		break;
+	default:
 		return -EOPNOTSUPP;
+	}
 
 	ret = rtl8372n_sds_off(priv, rpcs->sds);
 	if (ret)
 		return ret;
-	ret = rtl8372n_sds_set_mode(priv, rpcs->sds, RTL8372N_SDS_MODE_10GBASER);
+	ret = rtl8372n_sds_set_mode(priv, rpcs->sds, mode);
 	if (ret)
 		return ret;
 	ret = rtl8372n_sds_tune_10g(priv, rpcs->sds);
 	if (ret)
 		return ret;
+	if (interface == PHY_INTERFACE_MODE_USXGMII) {
+		u16 an = 0;
+
+		if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED)
+			an = RTL8372N_SDS_USX_AN_EN;
+
+		ret = rtl8372n_sds_update_bits(priv, rpcs->sds,
+					       RTL8372N_SDS_USX_AN_PAGE,
+					       RTL8372N_SDS_USX_AN_EN_REG,
+					       RTL8372N_SDS_USX_AN_EN, an);
+		if (ret)
+			return ret;
+		ret = rtl8372n_sds_usxgmii_standard(priv, rpcs->sds);
+		if (ret)
+			return ret;
+	}
 	msleep(250);
 
 	return rtl8372n_sds_on(priv, rpcs->sds);
@@ -416,6 +487,9 @@ static unsigned int rtl8372n_pcs_inband_caps(struct phylink_pcs *pcs,
 	/* 10GBASE-R has no in-band negotiation */
 	if (interface == PHY_INTERFACE_MODE_10GBASER)
 		return LINK_INBAND_DISABLE;
+	/* The speed of a USXGMII link is only known from the negotiation */
+	if (interface == PHY_INTERFACE_MODE_USXGMII)
+		return LINK_INBAND_ENABLE;
 
 	return 0;
 }
@@ -434,6 +508,43 @@ static void rtl8372n_pcs_get_state(struct phylink_pcs *pcs,
 	state->link = !!(val & BIT(rpcs->port));
 	state->speed = SPEED_10000;
 	state->duplex = DUPLEX_FULL;
+
+	/* A 10GBASE-R link has one speed; USXGMII negotiates it */
+	if (state->interface != PHY_INTERFACE_MODE_USXGMII || !state->link)
+		return;
+
+	state->an_complete = true;
+	state->speed = SPEED_UNKNOWN;
+	state->duplex = DUPLEX_UNKNOWN;
+
+	if (regmap_read(rpcs->priv->map, RTL8372N_DUPLEX_STATUS_REG, &val))
+		return;
+	state->duplex = val & BIT(rpcs->port) ? DUPLEX_FULL : DUPLEX_HALF;
+
+	if (regmap_read(rpcs->priv->map,
+			RTL8372N_SPEED_STATUS_REG(rpcs->port), &val))
+		return;
+
+	switch (field_get(RTL8372N_SPEED_STATUS(rpcs->port), val)) {
+	case RTL8372N_SPEED_STATUS_10:
+		state->speed = SPEED_10;
+		break;
+	case RTL8372N_SPEED_STATUS_100:
+		state->speed = SPEED_100;
+		break;
+	case RTL8372N_SPEED_STATUS_1000:
+		state->speed = SPEED_1000;
+		break;
+	case RTL8372N_SPEED_STATUS_2500:
+		state->speed = SPEED_2500;
+		break;
+	case RTL8372N_SPEED_STATUS_5000:
+		state->speed = SPEED_5000;
+		break;
+	case RTL8372N_SPEED_STATUS_10000:
+		state->speed = SPEED_10000;
+		break;
+	}
 }
 
 static const struct phylink_pcs_ops rtl8372n_pcs_ops = {
@@ -713,7 +824,11 @@ static void rtl8372n_phylink_get_caps(struct dsa_switch *ds, int port,
 	} else if (rtl8372n_is_serdes_port(port)) {
 		__set_bit(PHY_INTERFACE_MODE_10GBASER,
 			  config->supported_interfaces);
-		config->mac_capabilities = MAC_10000FD | MAC_SYM_PAUSE |
+		__set_bit(PHY_INTERFACE_MODE_USXGMII,
+			  config->supported_interfaces);
+		config->mac_capabilities = MAC_10FD | MAC_100FD | MAC_1000FD |
+					   MAC_2500FD | MAC_5000FD |
+					   MAC_10000FD | MAC_SYM_PAUSE |
 					   MAC_ASYM_PAUSE;
 	}
 }
@@ -999,6 +1114,8 @@ static int rtl8372n_detect(struct realtek_priv *priv)
 		chip->pcs[i].sds = i;
 		chip->pcs[i].port = i ? 8 : 3;
 		__set_bit(PHY_INTERFACE_MODE_10GBASER,
+			  chip->pcs[i].pcs.supported_interfaces);
+		__set_bit(PHY_INTERFACE_MODE_USXGMII,
 			  chip->pcs[i].pcs.supported_interfaces);
 	}
 
