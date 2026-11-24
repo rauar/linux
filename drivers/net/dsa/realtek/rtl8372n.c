@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/if_bridge.h>
+#include <linux/if_ether.h>
 #include <linux/if_vlan.h>
 #include <linux/mdio.h>
 #include <linux/mod_devicetable.h>
@@ -21,6 +22,7 @@
 #include <linux/phy.h>
 #include <linux/phylink.h>
 #include <linux/regmap.h>
+#include <linux/unaligned.h>
 #include <linux/wordpart.h>
 #include <net/dsa.h>
 
@@ -91,6 +93,35 @@
 #define RTL8372N_L2_FLUSH_MODE_REG		0x53dc
 #define RTL8372N_L2_FLUSH_MODE			GENMASK(1, 0)
 #define RTL8372N_L2_FLUSH_MODE_PORT		0
+
+/* Indirect access to the address table: a command register, and three data
+ * words for an entry
+ */
+#define RTL8372N_TBL_CMD_REG			0x5cac
+#define RTL8372N_TBL_CMD_INDEX			GENMASK(28, 16)
+#define RTL8372N_TBL_CMD_TYPE			GENMASK(10, 8)
+#define RTL8372N_TBL_CMD_TYPE_L2		4
+/* Start bit, reads as 1 while the command runs */
+#define RTL8372N_TBL_CMD_EXEC			BIT(0)
+
+#define RTL8372N_TBL_RDATA_REG(i)		(0x5ccc + (i) * 4)
+#define RTL8372N_L2_ENTRY_WORDS			3
+
+/* How a read command searches the address table, and its result */
+#define RTL8372N_L2_LOOKUP_REG			0x5cb0
+#define RTL8372N_L2_LOOKUP_PORT			GENMASK(22, 19)
+#define RTL8372N_L2_LOOKUP_METHOD		GENMASK(17, 14)
+/* Next unicast entry of the port, starting at the index of the command */
+#define RTL8372N_L2_LOOKUP_METHOD_NEXT_UC_PORT	7
+#define RTL8372N_L2_LOOKUP_HIT			BIT(12)
+#define RTL8372N_L2_LOOKUP_INDEX		GENMASK(11, 0)
+
+/* Unicast entry: word 0 holds the last four bytes of the address */
+#define RTL8372N_L2_UC_D1_MAC_HI		GENMASK(15, 0)
+#define RTL8372N_L2_UC_D1_VID			GENMASK(27, 16)
+/* The entry is keyed by VLAN ID; without it the field is a filtering ID */
+#define RTL8372N_L2_UC_D1_IVL			BIT(29)
+#define RTL8372N_L2_UC_D2_STATIC		BIT(16)
 
 #define RTL8372N_SDS_CMD_REG		0x03f8
 #define RTL8372N_SDS_CMD_INDEX		BIT(0)
@@ -199,6 +230,7 @@ struct rtl8372n_pcs {
 struct rtl8372n {
 	struct mutex sds_lock;		/* SerDes access sequences (0x03f8-0x0400) */
 	struct mutex mib_lock;		/* MIB access sequences (0x0f60-0x0f68) */
+	struct mutex tbl_lock;		/* table access sequences (0x5cac-0x5cd4) */
 	u32 chip_ver;
 	struct rtl8372n_pcs pcs[2];	/* one per SerDes */
 };
@@ -1012,6 +1044,116 @@ err:
 		ERR_PTR(ret));
 }
 
+static int rtl8372n_tbl_wait(struct realtek_priv *priv)
+{
+	u32 val;
+
+	return regmap_read_poll_timeout(priv->map, RTL8372N_TBL_CMD_REG, val,
+					!(val & RTL8372N_TBL_CMD_EXEC),
+					100, 100 * USEC_PER_MSEC);
+}
+
+/* Read the first unicast entry of a port at or after *index. Returns -ENOENT
+ * if there is none.
+ */
+static int rtl8372n_l2_read_next(struct realtek_priv *priv, int port,
+				 u32 *index, u32 *data)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	int ret, i;
+	u32 val;
+
+	mutex_lock(&chip->tbl_lock);
+
+	ret = rtl8372n_tbl_wait(priv);
+	if (ret)
+		goto out;
+
+	ret = regmap_update_bits(priv->map, RTL8372N_L2_LOOKUP_REG,
+				 RTL8372N_L2_LOOKUP_METHOD |
+				 RTL8372N_L2_LOOKUP_PORT,
+				 FIELD_PREP(RTL8372N_L2_LOOKUP_METHOD,
+					    RTL8372N_L2_LOOKUP_METHOD_NEXT_UC_PORT) |
+				 FIELD_PREP(RTL8372N_L2_LOOKUP_PORT, port));
+	if (ret)
+		goto out;
+
+	ret = regmap_write(priv->map, RTL8372N_TBL_CMD_REG,
+			   FIELD_PREP(RTL8372N_TBL_CMD_INDEX, *index) |
+			   FIELD_PREP(RTL8372N_TBL_CMD_TYPE,
+				      RTL8372N_TBL_CMD_TYPE_L2) |
+			   RTL8372N_TBL_CMD_EXEC);
+	if (ret)
+		goto out;
+
+	ret = rtl8372n_tbl_wait(priv);
+	if (ret)
+		goto out;
+
+	ret = regmap_read(priv->map, RTL8372N_L2_LOOKUP_REG, &val);
+	if (ret)
+		goto out;
+
+	if (!(val & RTL8372N_L2_LOOKUP_HIT)) {
+		ret = -ENOENT;
+		goto out;
+	}
+	*index = FIELD_GET(RTL8372N_L2_LOOKUP_INDEX, val);
+
+	for (i = 0; i < RTL8372N_L2_ENTRY_WORDS; i++) {
+		ret = regmap_read(priv->map, RTL8372N_TBL_RDATA_REG(i),
+				  &data[i]);
+		if (ret)
+			goto out;
+	}
+
+out:
+	mutex_unlock(&chip->tbl_lock);
+
+	return ret;
+}
+
+static int rtl8372n_port_fdb_dump(struct dsa_switch *ds, int port,
+				  dsa_fdb_dump_cb_t *cb, void *data)
+{
+	struct realtek_priv *priv = ds->priv;
+	u32 entry[RTL8372N_L2_ENTRY_WORDS];
+	u8 addr[ETH_ALEN];
+	u32 index = 0;
+	u32 found;
+	u16 vid;
+	int ret;
+
+	while (index < RTL8372N_L2_TABLE_SIZE) {
+		found = index;
+		ret = rtl8372n_l2_read_next(priv, port, &found, entry);
+		if (ret == -ENOENT)
+			break;
+		if (ret)
+			return ret;
+
+		/* After the last entry the search starts again at the first */
+		if (found < index)
+			break;
+
+		put_unaligned_be16(FIELD_GET(RTL8372N_L2_UC_D1_MAC_HI,
+					     entry[1]), &addr[0]);
+		put_unaligned_be32(entry[0], &addr[2]);
+
+		vid = 0;
+		if (entry[1] & RTL8372N_L2_UC_D1_IVL)
+			vid = FIELD_GET(RTL8372N_L2_UC_D1_VID, entry[1]);
+
+		ret = cb(addr, vid, entry[2] & RTL8372N_L2_UC_D2_STATIC, data);
+		if (ret)
+			return ret;
+
+		index = found + 1;
+	}
+
+	return 0;
+}
+
 static void rtl8372n_port_stp_state_set(struct dsa_switch *ds, int port,
 					u8 state)
 {
@@ -1194,6 +1336,7 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_disable = rtl8372n_port_disable,
 	.port_stp_state_set = rtl8372n_port_stp_state_set,
 	.port_fast_age = rtl8372n_port_fast_age,
+	.port_fdb_dump = rtl8372n_port_fdb_dump,
 	.port_bridge_join = rtl83xx_port_bridge_join,
 	.port_bridge_leave = rtl83xx_port_bridge_leave,
 	.port_change_mtu = rtl8372n_port_change_mtu,
@@ -1249,6 +1392,10 @@ static int rtl8372n_detect(struct realtek_priv *priv)
 		return ret;
 
 	ret = devm_mutex_init(priv->dev, &chip->mib_lock);
+	if (ret)
+		return ret;
+
+	ret = devm_mutex_init(priv->dev, &chip->tbl_lock);
 	if (ret)
 		return ret;
 
