@@ -34,6 +34,29 @@ properties:
     $ref: /schemas/net/mdio.yaml#
     unevaluatedProperties: false
 
+  ethernet-ports:
+    type: object
+
+    patternProperties:
+      "^(ethernet-)?port@[0-9a-f]+$":
+        type: object
+
+        properties:
+          leds:
+            type: object
+
+            patternProperties:
+              "^led@[0-9a-f]+$":
+                type: object
+
+                properties:
+                  reg:
+                    maximum: 27
+                    description:
+                      LED output pin of the switch that drives this LED.
+                      Each pin can show any LED signal of any port; a port
+                      has up to four LEDs.
+
 required:
   - compatible
   - mdio
@@ -43,6 +66,8 @@ unevaluatedProperties: false
 
 examples:
   - |
+    #include <dt-bindings/leds/common.h>
+
     mdio {
         #address-cells = <1>;
         #size-cells = <0>;
@@ -67,6 +92,17 @@ examples:
                     label = "lan1";
                     phy-handle = <&phy4>;
                     phy-mode = "internal";
+
+                    leds {
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+
+                        led@19 {
+                            reg = <25>;
+                            function = LED_FUNCTION_LAN;
+                            color = <LED_COLOR_ID_GREEN>;
+                        };
+                    };
                 };
 
                 port@5 {
