@@ -12,6 +12,7 @@
 #include <linux/container_of.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/dsa/tag_rtl8_4.h>
 #include <linux/if_bridge.h>
 #include <linux/if_ether.h>
 #include <linux/if_vlan.h>
@@ -189,6 +190,19 @@
 #define RTL8372N_L2_UC_D2_AGE			GENMASK(4, 2)
 #define RTL8372N_L2_UC_D2_AGE_MAX		7
 #define RTL8372N_L2_UC_D2_STATIC		BIT(16)
+
+/* What a port does with a received IGMP or MLD message, two bits per message
+ * type (IGMPv1, IGMPv2, IGMPv3, MLDv1, MLDv2). The reset value lets the chip
+ * forward a report like any frame to its group: once the group has an entry
+ * without the CPU port, later reports for it never reach the CPU, so the
+ * bridge does not see new members and lets its existing ones time out.
+ * Trapping sends every such message only to the CPU, with this REASON in
+ * the tag.
+ */
+#define RTL8372N_IGMP_PORT_REG(port)		(0x52a0 + (port) * 4)
+#define RTL8372N_IGMP_PORT_ACTION		GENMASK(9, 0)
+#define RTL8372N_IGMP_PORT_ACTION_TRAP_ALL	0x2aa
+#define RTL8372N_TAG_REASON_IGMP_MLD		86
 
 #define RTL8372N_SDS_CMD_REG		0x03f8
 #define RTL8372N_SDS_CMD_INDEX		BIT(0)
@@ -773,6 +787,19 @@ rtl8372n_get_tag_protocol(struct dsa_switch *ds, int port,
 	return DSA_TAG_PROTO_RTL8_4;
 }
 
+static int rtl8372n_connect_tag_protocol(struct dsa_switch *ds,
+					 enum dsa_tag_protocol proto)
+{
+	struct rtl8_4_tagger_data *tagger_data = ds->tagger_data;
+
+	if (proto != DSA_TAG_PROTO_RTL8_4)
+		return -EOPNOTSUPP;
+
+	tagger_data->igmp_mld_trap_reason = RTL8372N_TAG_REASON_IGMP_MLD;
+
+	return 0;
+}
+
 static int rtl8372n_soft_reset(struct realtek_priv *priv)
 {
 	u32 val;
@@ -903,6 +930,23 @@ static int rtl8372n_setup_learning(struct realtek_priv *priv)
 	return 0;
 }
 
+static int rtl8372n_setup_igmp(struct realtek_priv *priv)
+{
+	struct dsa_port *dp;
+	int ret;
+
+	dsa_switch_for_each_user_port(dp, &priv->ds) {
+		ret = regmap_update_bits(priv->map,
+					 RTL8372N_IGMP_PORT_REG(dp->index),
+					 RTL8372N_IGMP_PORT_ACTION,
+					 RTL8372N_IGMP_PORT_ACTION_TRAP_ALL);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int rtl8372n_setup_polling(struct realtek_priv *priv)
 {
 	int ret;
@@ -972,6 +1016,12 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	ret = rtl8372n_setup_learning(priv);
 	if (ret) {
 		dev_err(ds->dev, "learning setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_igmp(priv);
+	if (ret) {
+		dev_err(ds->dev, "IGMP setup failed: %pe\n", ERR_PTR(ret));
 		return ret;
 	}
 
@@ -1936,6 +1986,7 @@ static int rtl8372n_port_vlan_filtering(struct dsa_switch *ds, int port,
 
 static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.get_tag_protocol = rtl8372n_get_tag_protocol,
+	.connect_tag_protocol = rtl8372n_connect_tag_protocol,
 	.setup = rtl8372n_setup,
 	.teardown = rtl8372n_teardown,
 	.phylink_get_caps = rtl8372n_phylink_get_caps,
