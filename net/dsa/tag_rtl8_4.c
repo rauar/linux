@@ -78,7 +78,9 @@
 
 #include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/dsa/tag_rtl8_4.h>
 #include <linux/etherdevice.h>
+#include <linux/slab.h>
 
 #include "tag.h"
 
@@ -153,6 +155,20 @@ static struct sk_buff *rtl8_4t_tag_xmit(struct sk_buff *skb,
 	return skb;
 }
 
+/* A trapped frame went only to the CPU, the switch did not forward it */
+static bool rtl8_4_trapped(struct net_device *conduit, u8 reason)
+{
+	struct rtl8_4_tagger_data *tagger_data;
+
+	if (reason == RTL8_4_REASON_TRAP)
+		return true;
+
+	tagger_data = conduit->dsa_ptr->ds->tagger_data;
+
+	return tagger_data && tagger_data->igmp_mld_trap_reason &&
+	       reason == tagger_data->igmp_mld_trap_reason;
+}
+
 static int rtl8_4_read_tag(struct sk_buff *skb, struct net_device *dev,
 			   void *tag)
 {
@@ -194,7 +210,7 @@ static int rtl8_4_read_tag(struct sk_buff *skb, struct net_device *dev,
 		return -ENOENT;
 	}
 
-	if (reason != RTL8_4_REASON_TRAP)
+	if (!rtl8_4_trapped(dev, reason))
 		dsa_default_offload_fwd_mark(skb);
 
 	return 0;
@@ -242,10 +258,35 @@ static struct sk_buff *rtl8_4t_tag_rcv(struct sk_buff *skb,
 	return skb;
 }
 
+/* Only the EtherType version has tagger data. On a change between the two
+ * versions the new one connects before the old one disconnects, so they
+ * cannot share it.
+ */
+static int rtl8_4_connect(struct dsa_switch *ds)
+{
+	struct rtl8_4_tagger_data *tagger_data;
+
+	tagger_data = kzalloc_obj(*tagger_data);
+	if (!tagger_data)
+		return -ENOMEM;
+
+	ds->tagger_data = tagger_data;
+
+	return 0;
+}
+
+static void rtl8_4_disconnect(struct dsa_switch *ds)
+{
+	kfree(ds->tagger_data);
+	ds->tagger_data = NULL;
+}
+
 /* Ethertype version */
 static const struct dsa_device_ops rtl8_4_netdev_ops = {
 	.name = "rtl8_4",
 	.proto = DSA_TAG_PROTO_RTL8_4,
+	.connect = rtl8_4_connect,
+	.disconnect = rtl8_4_disconnect,
 	.xmit = rtl8_4_tag_xmit,
 	.rcv = rtl8_4_tag_rcv,
 	.needed_headroom = RTL8_4_TAG_LEN,
