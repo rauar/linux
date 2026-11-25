@@ -191,6 +191,12 @@
 #define RTL8372N_L2_UC_D2_AGE_MAX		7
 #define RTL8372N_L2_UC_D2_STATIC		BIT(16)
 
+/* Multicast entry (group address): the member ports instead of a port, split
+ * like the port
+ */
+#define RTL8372N_L2_MC_D1_PORTS_LO		GENMASK(31, 30)
+#define RTL8372N_L2_MC_D2_PORTS_HI		GENMASK(7, 0)
+
 /* What a port does with a received IGMP or MLD message, two bits per message
  * type (IGMPv1, IGMPv2, IGMPv3, MLDv1, MLDv2). The reset value lets the chip
  * forward a report like any frame to its group: once the group has an entry
@@ -1937,6 +1943,73 @@ static int rtl8372n_port_fdb_del(struct dsa_switch *ds, int port,
 	return rtl8372n_l2_del(ds->priv, key);
 }
 
+/* Add a port to the members of a group address, or remove it. The entry goes
+ * when its last member does.
+ */
+static int rtl8372n_mdb_set_port(struct realtek_priv *priv, int port,
+				 const struct switchdev_obj_port_mdb *mdb,
+				 struct dsa_db db, bool member)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	u32 data[RTL8372N_L2_ENTRY_WORDS];
+	u32 key[RTL8372N_L2_ENTRY_WORDS];
+	u32 index, ports = 0;
+	bool found;
+	int ret;
+
+	rtl8372n_l2_key(mdb->addr, mdb->vid, db, key);
+
+	mutex_lock(&chip->tbl_lock);
+
+	ret = rtl8372n_l2_find(priv, key, &index, data);
+	found = !ret;
+	if (ret && ret != -ENOENT)
+		goto out;
+
+	if (found)
+		ports = FIELD_GET(RTL8372N_L2_MC_D1_PORTS_LO, data[1]) |
+			FIELD_GET(RTL8372N_L2_MC_D2_PORTS_HI, data[2]) << 2;
+	if (member)
+		ports |= BIT(port);
+	else
+		ports &= ~BIT(port);
+
+	if (!ports) {
+		ret = found ? __rtl8372n_l2_clear(priv, index) : 0;
+		goto out;
+	}
+
+	key[1] |= FIELD_PREP(RTL8372N_L2_MC_D1_PORTS_LO, ports & 0x3);
+	key[2] = FIELD_PREP(RTL8372N_L2_MC_D2_PORTS_HI, ports >> 2);
+	ret = __rtl8372n_l2_write(priv, key);
+
+out:
+	mutex_unlock(&chip->tbl_lock);
+
+	return ret;
+}
+
+static int rtl8372n_port_mdb_add(struct dsa_switch *ds, int port,
+				 const struct switchdev_obj_port_mdb *mdb,
+				 struct dsa_db db)
+{
+	return rtl8372n_mdb_set_port(ds->priv, port, mdb, db, true);
+}
+
+static int rtl8372n_port_mdb_del(struct dsa_switch *ds, int port,
+				 const struct switchdev_obj_port_mdb *mdb,
+				 struct dsa_db db)
+{
+	/* Bridges that filter by VLAN share the entries of a VLAN: keep the
+	 * CPU port in a group that another bridge still has
+	 */
+	if (mdb->vid && dsa_is_cpu_port(ds, port) &&
+	    dsa_mdb_present_in_other_db(ds, port, mdb, db))
+		return 0;
+
+	return rtl8372n_mdb_set_port(ds->priv, port, mdb, db, false);
+}
+
 static int rtl8372n_port_vlan_add(struct dsa_switch *ds, int port,
 				  const struct switchdev_obj_port_vlan *vlan,
 				  struct netlink_ext_ack *extack)
@@ -2029,6 +2102,8 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_fdb_add = rtl8372n_port_fdb_add,
 	.port_fdb_del = rtl8372n_port_fdb_del,
 	.port_fdb_dump = rtl8372n_port_fdb_dump,
+	.port_mdb_add = rtl8372n_port_mdb_add,
+	.port_mdb_del = rtl8372n_port_mdb_del,
 	.port_vlan_filtering = rtl8372n_port_vlan_filtering,
 	.port_vlan_add = rtl8372n_port_vlan_add,
 	.port_vlan_del = rtl8372n_port_vlan_del,
