@@ -1489,25 +1489,26 @@ out:
 }
 
 /* Write an entry. The switch chooses the place in the table from the address
- * and the ID in the entry. Returns -ENOSPC if it has no place for the entry.
+ * and the ID in the entry. The caller holds tbl_lock. Returns -ENOSPC if the
+ * switch has no place for the entry.
  */
-static int rtl8372n_l2_write(struct realtek_priv *priv, const u32 *data)
+static int __rtl8372n_l2_write(struct realtek_priv *priv, const u32 *data)
 {
 	struct rtl8372n *chip = priv->chip_data;
 	int ret, i;
 	u32 val;
 
-	mutex_lock(&chip->tbl_lock);
+	lockdep_assert_held(&chip->tbl_lock);
 
 	ret = rtl8372n_tbl_wait(priv);
 	if (ret)
-		goto out;
+		return ret;
 
 	for (i = 0; i < RTL8372N_L2_ENTRY_WORDS; i++) {
 		ret = regmap_write(priv->map, RTL8372N_TBL_WDATA_REG(i),
 				   data[i]);
 		if (ret)
-			goto out;
+			return ret;
 	}
 
 	ret = regmap_write(priv->map, RTL8372N_TBL_CMD_REG,
@@ -1515,30 +1516,37 @@ static int rtl8372n_l2_write(struct realtek_priv *priv, const u32 *data)
 				      RTL8372N_TBL_CMD_TYPE_L2) |
 			   RTL8372N_TBL_CMD_WRITE | RTL8372N_TBL_CMD_EXEC);
 	if (ret)
-		goto out;
+		return ret;
 
 	ret = rtl8372n_tbl_wait(priv);
 	if (ret)
-		goto out;
+		return ret;
 
 	ret = regmap_read(priv->map, RTL8372N_L2_LOOKUP_REG, &val);
 	if (ret)
-		goto out;
+		return ret;
 
-	if (!(val & RTL8372N_L2_LOOKUP_HIT))
-		ret = -ENOSPC;
+	return val & RTL8372N_L2_LOOKUP_HIT ? 0 : -ENOSPC;
+}
 
-out:
+static int rtl8372n_l2_write(struct realtek_priv *priv, const u32 *data)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	int ret;
+
+	mutex_lock(&chip->tbl_lock);
+	ret = __rtl8372n_l2_write(priv, data);
 	mutex_unlock(&chip->tbl_lock);
 
 	return ret;
 }
 
-/* Find the entry that has the address and the ID of key. The caller holds
- * tbl_lock. Returns -ENOENT if there is none.
+/* Find the entry that has the address and the ID of key, and read its words
+ * into data unless data is NULL. The caller holds tbl_lock. Returns -ENOENT
+ * if there is none.
  */
 static int rtl8372n_l2_find(struct realtek_priv *priv, const u32 *key,
-			    u32 *index)
+			    u32 *index, u32 *data)
 {
 	struct rtl8372n *chip = priv->chip_data;
 	int ret, i;
@@ -1583,31 +1591,32 @@ static int rtl8372n_l2_find(struct realtek_priv *priv, const u32 *key,
 		return -ENOENT;
 
 	*index = FIELD_GET(RTL8372N_L2_LOOKUP_INDEX, val);
+	if (!data)
+		return 0;
+
+	for (i = 0; i < RTL8372N_L2_ENTRY_WORDS; i++) {
+		ret = regmap_read(priv->map, RTL8372N_TBL_RDATA_REG(i),
+				  &data[i]);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
 
-/* Remove the entry that has the address and the ID of key, if there is one */
-static int rtl8372n_l2_del(struct realtek_priv *priv, const u32 *key)
+/* Clear the entry at index. The caller holds tbl_lock. */
+static int __rtl8372n_l2_clear(struct realtek_priv *priv, u32 index)
 {
 	struct rtl8372n *chip = priv->chip_data;
 	int ret, err;
-	u32 index;
 
-	mutex_lock(&chip->tbl_lock);
-
-	ret = rtl8372n_l2_find(priv, key, &index);
-	if (ret) {
-		if (ret == -ENOENT)
-			ret = 0;
-		goto out;
-	}
+	lockdep_assert_held(&chip->tbl_lock);
 
 	ret = regmap_update_bits(priv->map, RTL8372N_L2_LOOKUP_REG,
 				 RTL8372N_L2_LOOKUP_CLEAR,
 				 RTL8372N_L2_LOOKUP_CLEAR);
 	if (ret)
-		goto out;
+		return ret;
 
 	ret = regmap_write(priv->map, RTL8372N_TBL_CMD_REG,
 			   FIELD_PREP(RTL8372N_TBL_CMD_INDEX, index) |
@@ -1620,10 +1629,25 @@ static int rtl8372n_l2_del(struct realtek_priv *priv, const u32 *key)
 	/* Without this, the next write command would clear an entry, too */
 	err = regmap_update_bits(priv->map, RTL8372N_L2_LOOKUP_REG,
 				 RTL8372N_L2_LOOKUP_CLEAR, 0);
-	if (!ret)
-		ret = err;
 
-out:
+	return ret ? ret : err;
+}
+
+/* Remove the entry that has the address and the ID of key, if there is one */
+static int rtl8372n_l2_del(struct realtek_priv *priv, const u32 *key)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	u32 index;
+	int ret;
+
+	mutex_lock(&chip->tbl_lock);
+
+	ret = rtl8372n_l2_find(priv, key, &index, NULL);
+	if (!ret)
+		ret = __rtl8372n_l2_clear(priv, index);
+	else if (ret == -ENOENT)
+		ret = 0;
+
 	mutex_unlock(&chip->tbl_lock);
 
 	return ret;
@@ -1849,12 +1873,12 @@ static void rtl8372n_get_eth_mac_stats(struct dsa_switch *ds, int port,
 	mac_stats->FramesAbortedDueToXSColls = cnt[RTL8372N_MIB_EXCESS_COLL];
 }
 
-/* The words of a static entry for an address on a port. Like the entries the
- * switch learns, an entry for a VLAN is keyed by the VLAN ID and any other by
- * the filtering ID of the bridge (0 outside a bridge).
+/* The words of the key of an entry: the address and, like the entries the
+ * switch learns, the VLAN ID for an entry of a VLAN and the filtering ID of
+ * the bridge (0 outside a bridge) for any other
  */
-static void rtl8372n_l2_pack(const unsigned char *addr, int port, u16 vid,
-			     struct dsa_db db, u32 *data)
+static void rtl8372n_l2_key(const unsigned char *addr, u16 vid,
+			    struct dsa_db db, u32 *data)
 {
 	u32 key;
 
@@ -1868,8 +1892,16 @@ static void rtl8372n_l2_pack(const unsigned char *addr, int port, u16 vid,
 
 	data[0] = get_unaligned_be32(&addr[2]);
 	data[1] = FIELD_PREP(RTL8372N_L2_UC_D1_MAC_HI,
-			     get_unaligned_be16(&addr[0])) | key |
-		  FIELD_PREP(RTL8372N_L2_UC_D1_PORT_LO, port & 0x3);
+			     get_unaligned_be16(&addr[0])) | key;
+	data[2] = 0;
+}
+
+/* The words of a static entry for an address on a port */
+static void rtl8372n_l2_pack(const unsigned char *addr, int port, u16 vid,
+			     struct dsa_db db, u32 *data)
+{
+	rtl8372n_l2_key(addr, vid, db, data);
+	data[1] |= FIELD_PREP(RTL8372N_L2_UC_D1_PORT_LO, port & 0x3);
 	data[2] = FIELD_PREP(RTL8372N_L2_UC_D2_PORT_HI, port >> 2) |
 		  FIELD_PREP(RTL8372N_L2_UC_D2_AGE,
 			     RTL8372N_L2_UC_D2_AGE_MAX) |
