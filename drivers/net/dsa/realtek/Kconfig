@@ -53,6 +53,7 @@ config NET_DSA_REALTEK_RTL8366RB_LEDS
 config NET_DSA_REALTEK_RTL8372N
 	tristate "Realtek RTL8372N switch driver"
 	depends on NET_DSA_REALTEK_MDIO
+	depends on LEDS_CLASS || !LEDS_CLASS
 	select NET_DSA_TAG_RTL8_4
 	help
 	  Select to enable support for the Realtek RTL8372N Ethernet switch.

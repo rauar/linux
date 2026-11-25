@@ -16,11 +16,13 @@
 #include <linux/if_bridge.h>
 #include <linux/if_ether.h>
 #include <linux/if_vlan.h>
+#include <linux/leds.h>
 #include <linux/lockdep.h>
 #include <linux/mdio.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/phy.h>
 #include <linux/phylink.h>
 #include <linux/regmap.h>
@@ -230,6 +232,37 @@
 #define RTL8372N_IGMP_PORT_ACTION_TRAP_ALL	0x2aa
 #define RTL8372N_TAG_REASON_IGMP_MLD		86
 
+/* Port LEDs. Every port has four LED signals (index 0 to 3). What a signal
+ * shows is configured per LED set and index; each port uses one of four
+ * sets. Each of the 28 LED output pins shows one signal of one port, or is
+ * driven by software as a GPIO.
+ */
+#define RTL8372N_NUM_LED_PINS			28
+#define RTL8372N_NUM_PORT_LEDS			4
+#define RTL8372N_LED_SET			3	/* used by every port */
+#define RTL8372N_LED_CFG_REG(set, idx)		(0x652c + (3 - (set)) * 8 + \
+						 (1 - (idx) / 2) * 4)
+#define RTL8372N_LED_CFG_SHIFT(idx)		((idx) % 2 * 16)
+/* On with link, blinking on traffic */
+#define RTL8372N_LED_CFG_LINK_ACT		0x017d
+#define RTL8372N_LED_MODE_REG(set)		(0x6524 + (1 - (set) / 2) * 4)
+#define RTL8372N_LED_MODE_SHIFT(set, idx)	((set) % 2 * 16 + (idx) * 4)
+#define RTL8372N_LED_MODE_LINK_ACT		5	/* vendor value */
+#define RTL8372N_LED_PORT_SET_REG		0x654c	/* 2 bits per port */
+#define RTL8372N_LED_IO_EN_REG			0x65dc	/* 1 bit per pin */
+#define RTL8372N_LED_IO_EN_GLOBAL		BIT(30)
+#define RTL8372N_LED_MUX_REG(pin)		(0x65e0 + ((pin) / 5) * 4)
+#define RTL8372N_LED_MUX_SHIFT(pin)		((pin) % 5 * 6)
+#define RTL8372N_LED_MUX(port, idx)		((port) << 2 | (idx))
+#define RTL8372N_GPIO_OUT_REG			0x003c	/* 1 bit per pin */
+#define RTL8372N_GPIO_OE_REG			0x004c
+#define RTL8372N_GPIO_MODE_REG			0x7f8c	/* 1: pin is a GPIO */
+
+/* The rules of RTL8372N_LED_CFG_LINK_ACT, as netdev trigger modes */
+#define RTL8372N_LED_RULES	(BIT(TRIGGER_NETDEV_LINK) | \
+				 BIT(TRIGGER_NETDEV_RX) | \
+				 BIT(TRIGGER_NETDEV_TX))
+
 #define RTL8372N_SDS_CMD_REG		0x03f8
 #define RTL8372N_SDS_CMD_INDEX		BIT(0)
 #define RTL8372N_SDS_CMD_PAGE		GENMASK(6, 1)
@@ -331,6 +364,13 @@ struct rtl8372n_pcs {
 	struct realtek_priv *priv;
 	int sds;
 	int port;
+};
+
+struct rtl8372n_led {
+	struct led_classdev cdev;
+	struct realtek_priv *priv;
+	int port;
+	int pin;
 };
 
 /* Chip data, in realtek_priv::chip_data */
@@ -1065,6 +1105,227 @@ static int rtl8372n_setup_eee(struct realtek_priv *priv)
 	return 0;
 }
 
+static struct rtl8372n_led *to_rtl8372n_led(struct led_classdev *cdev)
+{
+	return container_of(cdev, struct rtl8372n_led, cdev);
+}
+
+/* Software control: the pin becomes a GPIO output */
+static int rtl8372n_led_brightness_set(struct led_classdev *cdev,
+				       enum led_brightness brightness)
+{
+	struct rtl8372n_led *led = to_rtl8372n_led(cdev);
+	struct regmap *map = led->priv->map;
+	u32 bit = BIT(led->pin);
+	int ret;
+
+	ret = regmap_update_bits(map, RTL8372N_GPIO_OUT_REG, bit,
+				 brightness ? bit : 0);
+	if (ret)
+		return ret;
+
+	ret = regmap_set_bits(map, RTL8372N_GPIO_OE_REG, bit);
+	if (ret)
+		return ret;
+
+	return regmap_set_bits(map, RTL8372N_GPIO_MODE_REG, bit);
+}
+
+#ifdef CONFIG_LEDS_TRIGGERS
+static int rtl8372n_led_hw_control_is_supported(struct led_classdev *cdev,
+						unsigned long rules)
+{
+	return rules == RTL8372N_LED_RULES ? 0 : -EOPNOTSUPP;
+}
+
+/* Hardware control: the pin shows its port's LED signal again */
+static int rtl8372n_led_hw_control_set(struct led_classdev *cdev,
+				       unsigned long rules)
+{
+	struct rtl8372n_led *led = to_rtl8372n_led(cdev);
+
+	if (rules != RTL8372N_LED_RULES)
+		return -EOPNOTSUPP;
+
+	return regmap_clear_bits(led->priv->map, RTL8372N_GPIO_MODE_REG,
+				 BIT(led->pin));
+}
+
+static int rtl8372n_led_hw_control_get(struct led_classdev *cdev,
+				       unsigned long *rules)
+{
+	struct rtl8372n_led *led = to_rtl8372n_led(cdev);
+	u32 val;
+	int ret;
+
+	ret = regmap_read(led->priv->map, RTL8372N_GPIO_MODE_REG, &val);
+	if (ret)
+		return ret;
+
+	if (val & BIT(led->pin))
+		return -EINVAL;
+
+	*rules = RTL8372N_LED_RULES;
+
+	return 0;
+}
+
+static struct device *
+rtl8372n_led_hw_control_get_device(struct led_classdev *cdev)
+{
+	struct rtl8372n_led *led = to_rtl8372n_led(cdev);
+	struct dsa_port *dp;
+
+	dp = dsa_to_port(&led->priv->ds, led->port);
+
+	return dp->user ? &dp->user->dev : NULL;
+}
+
+static void rtl8372n_led_init_hw_control(struct led_classdev *cdev)
+{
+	cdev->hw_control_is_supported = rtl8372n_led_hw_control_is_supported;
+	cdev->hw_control_set = rtl8372n_led_hw_control_set;
+	cdev->hw_control_get = rtl8372n_led_hw_control_get;
+	cdev->hw_control_get_device = rtl8372n_led_hw_control_get_device;
+	cdev->hw_control_trigger = "netdev";
+}
+#else
+static void rtl8372n_led_init_hw_control(struct led_classdev *cdev)
+{
+}
+#endif
+
+/* Route LED signal idx of the port to the LED's pin and register the LED */
+static int rtl8372n_setup_led(struct realtek_priv *priv, struct dsa_port *dp,
+			      struct device_node *np, int idx)
+{
+	struct led_init_data init_data = {};
+	struct regmap *map = priv->map;
+	int set = RTL8372N_LED_SET;
+	struct rtl8372n_led *led;
+	u32 pin, shift;
+	int ret;
+
+	ret = of_property_read_u32(np, "reg", &pin);
+	if (ret || pin >= RTL8372N_NUM_LED_PINS) {
+		dev_err(priv->dev, "port %d: invalid LED pin\n", dp->index);
+		return -EINVAL;
+	}
+
+	led = devm_kzalloc(priv->dev, sizeof(*led), GFP_KERNEL);
+	if (!led)
+		return -ENOMEM;
+
+	led->priv = priv;
+	led->port = dp->index;
+	led->pin = pin;
+
+	shift = RTL8372N_LED_CFG_SHIFT(idx);
+	ret = regmap_update_bits(map, RTL8372N_LED_CFG_REG(set, idx),
+				 GENMASK(15, 0) << shift,
+				 RTL8372N_LED_CFG_LINK_ACT << shift);
+	if (ret)
+		return ret;
+
+	shift = RTL8372N_LED_MODE_SHIFT(set, idx);
+	ret = regmap_update_bits(map, RTL8372N_LED_MODE_REG(set),
+				 GENMASK(3, 0) << shift,
+				 RTL8372N_LED_MODE_LINK_ACT << shift);
+	if (ret)
+		return ret;
+
+	shift = dp->index * 2;
+	ret = regmap_update_bits(map, RTL8372N_LED_PORT_SET_REG,
+				 GENMASK(1, 0) << shift, set << shift);
+	if (ret)
+		return ret;
+
+	shift = RTL8372N_LED_MUX_SHIFT(pin);
+	ret = regmap_update_bits(map, RTL8372N_LED_MUX_REG(pin),
+				 GENMASK(5, 0) << shift,
+				 RTL8372N_LED_MUX(dp->index, idx) << shift);
+	if (ret)
+		return ret;
+
+	ret = regmap_set_bits(map, RTL8372N_LED_IO_EN_REG, BIT(pin));
+	if (ret)
+		return ret;
+
+	/* "keep" leaves the pin as it is, after reset under hardware control */
+	switch (led_init_default_state_get(of_fwnode_handle(np))) {
+	case LEDS_DEFSTATE_ON:
+		led->cdev.brightness = 1;
+		ret = rtl8372n_led_brightness_set(&led->cdev, 1);
+		break;
+	case LEDS_DEFSTATE_KEEP:
+		break;
+	default:
+		ret = rtl8372n_led_brightness_set(&led->cdev, 0);
+	}
+	if (ret)
+		return ret;
+
+	led->cdev.max_brightness = 1;
+	led->cdev.brightness_set_blocking = rtl8372n_led_brightness_set;
+	rtl8372n_led_init_hw_control(&led->cdev);
+
+	init_data.fwnode = of_fwnode_handle(np);
+	init_data.devname_mandatory = true;
+	init_data.devicename = devm_kasprintf(priv->dev, GFP_KERNEL,
+					      "rtl8372n-%u:%02d",
+					      dp->ds->index, dp->index);
+	if (!init_data.devicename)
+		return -ENOMEM;
+
+	return devm_led_classdev_register_ext(priv->dev, &led->cdev,
+					      &init_data);
+}
+
+/* The LEDs of a port are given by their pins; they use its signals in order */
+static int rtl8372n_setup_leds(struct realtek_priv *priv)
+{
+	struct device_node *leds_np;
+	struct dsa_port *dp;
+	bool found = false;
+	int idx, ret;
+
+	if (!IS_ENABLED(CONFIG_LEDS_CLASS))
+		return 0;
+
+	dsa_switch_for_each_user_port(dp, &priv->ds) {
+		leds_np = of_get_child_by_name(dp->dn, "leds");
+		if (!leds_np)
+			continue;
+
+		idx = 0;
+		ret = 0;
+		for_each_available_child_of_node_scoped(leds_np, np) {
+			if (idx == RTL8372N_NUM_PORT_LEDS) {
+				dev_err(priv->dev, "port %d: too many LEDs\n",
+					dp->index);
+				ret = -EINVAL;
+				break;
+			}
+
+			ret = rtl8372n_setup_led(priv, dp, np, idx++);
+			if (ret)
+				break;
+		}
+		of_node_put(leds_np);
+		if (ret)
+			return ret;
+
+		if (idx)
+			found = true;
+	}
+
+	if (!found)
+		return 0;
+
+	return regmap_set_bits(priv->map, RTL8372N_LED_IO_EN_REG,
+			       RTL8372N_LED_IO_EN_GLOBAL);
+}
+
 static int rtl8372n_setup_polling(struct realtek_priv *priv)
 {
 	int ret;
@@ -1153,6 +1414,12 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	ret = rtl8372n_setup_eee(priv);
 	if (ret) {
 		dev_err(ds->dev, "EEE setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_leds(priv);
+	if (ret) {
+		dev_err(ds->dev, "LED setup failed: %pe\n", ERR_PTR(ret));
 		return ret;
 	}
 
