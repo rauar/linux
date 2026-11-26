@@ -27,6 +27,7 @@
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
+#include <linux/workqueue.h>
 #include <net/dsa.h>
 
 #include "realtek.h"
@@ -86,6 +87,12 @@
 #define RTL8372N_L2_LEARN_LIMIT			GENMASK(12, 0)
 /* Size of the address table: a port with this limit learns without limit */
 #define RTL8372N_L2_TABLE_SIZE			4160
+
+/* What a port does with a unicast frame whose address is not in the table */
+#define RTL8372N_L2_UC_LM_ACT_REG		0x5374
+#define RTL8372N_L2_UC_LM_ACT(port)		(GENMASK(1, 0) << ((port) * 2))
+#define RTL8372N_L2_LM_ACT_FLOOD_MASK		0	/* by the flood port mask */
+#define RTL8372N_L2_LM_ACT_DROP			1
 
 /* Remove the learned addresses of the ports in the command */
 #define RTL8372N_L2_FLUSH_CMD_REG		0x53d4
@@ -322,6 +329,9 @@ struct rtl8372n {
 	struct rtl8372n_pcs pcs[2];	/* one per SerDes */
 	u16 pvid[RTL8372N_NUM_PORTS];	/* the bridge's PVID, 0 = none (rtnl) */
 	struct devlink_region *vlan_region;
+	struct realtek_priv *priv;
+	struct work_struct host_flood_work;
+	unsigned long host_flood_uc;	/* ports that take unknown unicast */
 };
 
 /* Wait until the SerDes access unit has finished its last command */
@@ -936,6 +946,49 @@ static int rtl8372n_setup_learning(struct realtek_priv *priv)
 	return 0;
 }
 
+/* A port that does not ask for unknown unicast (not promiscuous) drops it,
+ * so the CPU only gets the addresses DSA put into the table for the host.
+ */
+static int rtl8372n_write_host_flood(struct realtek_priv *priv)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	struct dsa_port *dp;
+	u32 mask = 0;
+	u32 val = 0;
+
+	dsa_switch_for_each_user_port(dp, &priv->ds) {
+		mask |= RTL8372N_L2_UC_LM_ACT(dp->index);
+		if (!test_bit(dp->index, &chip->host_flood_uc))
+			val |= field_prep(RTL8372N_L2_UC_LM_ACT(dp->index),
+					  RTL8372N_L2_LM_ACT_DROP);
+	}
+
+	return regmap_update_bits(priv->map, RTL8372N_L2_UC_LM_ACT_REG, mask,
+				  val);
+}
+
+static void rtl8372n_host_flood_work(struct work_struct *work)
+{
+	struct rtl8372n *chip = container_of(work, struct rtl8372n,
+					     host_flood_work);
+	int ret;
+
+	ret = rtl8372n_write_host_flood(chip->priv);
+	if (ret)
+		dev_err(chip->priv->dev, "cannot set host flooding: %pe\n",
+			ERR_PTR(ret));
+}
+
+static int rtl8372n_setup_host_flood(struct realtek_priv *priv)
+{
+	struct rtl8372n *chip = priv->chip_data;
+
+	chip->priv = priv;
+	INIT_WORK(&chip->host_flood_work, rtl8372n_host_flood_work);
+
+	return rtl8372n_write_host_flood(priv);
+}
+
 static int rtl8372n_setup_igmp(struct realtek_priv *priv)
 {
 	struct dsa_port *dp;
@@ -1022,6 +1075,13 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	ret = rtl8372n_setup_learning(priv);
 	if (ret) {
 		dev_err(ds->dev, "learning setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_host_flood(priv);
+	if (ret) {
+		dev_err(ds->dev, "host flood setup failed: %pe\n",
+			ERR_PTR(ret));
 		return ret;
 	}
 
@@ -1416,7 +1476,25 @@ static void rtl8372n_teardown(struct dsa_switch *ds)
 
 	chip = priv->chip_data;
 
+	cancel_work_sync(&chip->host_flood_work);
 	dsa_devlink_region_destroy(chip->vlan_region);
+}
+
+/* Called in atomic context, so the register write is deferred */
+static void rtl8372n_port_set_host_flood(struct dsa_switch *ds, int port,
+					 bool uc, bool mc)
+{
+	struct realtek_priv *priv = ds->priv;
+	struct rtl8372n *chip;
+
+	chip = priv->chip_data;
+
+	if (uc)
+		set_bit(port, &chip->host_flood_uc);
+	else
+		clear_bit(port, &chip->host_flood_uc);
+
+	schedule_work(&chip->host_flood_work);
 }
 
 /* Untagged frames go to the bridge's PVID only while the port filters by
@@ -2104,6 +2182,7 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_fdb_dump = rtl8372n_port_fdb_dump,
 	.port_mdb_add = rtl8372n_port_mdb_add,
 	.port_mdb_del = rtl8372n_port_mdb_del,
+	.port_set_host_flood = rtl8372n_port_set_host_flood,
 	.port_vlan_filtering = rtl8372n_port_vlan_filtering,
 	.port_vlan_add = rtl8372n_port_vlan_add,
 	.port_vlan_del = rtl8372n_port_vlan_del,
