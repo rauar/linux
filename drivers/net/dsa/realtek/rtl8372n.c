@@ -23,6 +23,7 @@
 #include <linux/phy.h>
 #include <linux/phylink.h>
 #include <linux/regmap.h>
+#include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
 #include <net/dsa.h>
@@ -300,6 +301,7 @@ struct rtl8372n {
 	u32 chip_ver;
 	struct rtl8372n_pcs pcs[2];	/* one per SerDes */
 	u16 pvid[RTL8372N_NUM_PORTS];	/* the bridge's PVID, 0 = none (rtnl) */
+	struct devlink_region *vlan_region;
 };
 
 /* Wait until the SerDes access unit has finished its last command */
@@ -932,6 +934,8 @@ static int rtl8372n_setup_smi(struct realtek_priv *priv)
 				  RTL8372N_SMI_CTRL_MDC_EN);
 }
 
+static int rtl8372n_setup_regions(struct dsa_switch *ds);
+
 static int rtl8372n_setup(struct dsa_switch *ds)
 {
 	struct realtek_priv *priv = ds->priv;
@@ -984,8 +988,15 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	}
 
 	ret = rtl83xx_setup_user_mdio(ds);
-	if (ret)
+	if (ret) {
 		dev_err(ds->dev, "MDIO bus setup failed: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	ret = rtl8372n_setup_regions(ds);
+	if (ret)
+		dev_err(ds->dev, "devlink region setup failed: %pe\n",
+			ERR_PTR(ret));
 
 	return ret;
 }
@@ -1287,6 +1298,69 @@ static int rtl8372n_vlan_set_port(struct realtek_priv *priv, u16 vid, int port,
 		       RTL8372N_VLAN_IVL;
 
 	return rtl8372n_vlan_write(priv, vid, val);
+}
+
+/* Snapshot of the VLAN table for devlink, one raw table word per VID */
+static int rtl8372n_region_vlan_snapshot(struct devlink *dl,
+					 const struct devlink_region_ops *ops,
+					 struct netlink_ext_ack *extack,
+					 u8 **data)
+{
+	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
+	struct realtek_priv *priv = ds->priv;
+	u32 *table;
+	int ret;
+	u16 vid;
+
+	table = kmalloc_objs(*table, VLAN_N_VID);
+	if (!table)
+		return -ENOMEM;
+
+	for (vid = 0; vid < VLAN_N_VID; vid++) {
+		ret = rtl8372n_vlan_read(priv, vid, &table[vid]);
+		if (ret) {
+			kfree(table);
+			return ret;
+		}
+	}
+
+	*data = (u8 *)table;
+
+	return 0;
+}
+
+static const struct devlink_region_ops rtl8372n_region_vlan_ops = {
+	.name = "vlan",
+	.snapshot = rtl8372n_region_vlan_snapshot,
+	.destructor = kfree,
+};
+
+static int rtl8372n_setup_regions(struct dsa_switch *ds)
+{
+	struct realtek_priv *priv = ds->priv;
+	struct devlink_region *region;
+	struct rtl8372n *chip;
+
+	chip = priv->chip_data;
+
+	region = dsa_devlink_region_create(ds, &rtl8372n_region_vlan_ops, 1,
+					   VLAN_N_VID * sizeof(u32));
+	if (IS_ERR(region))
+		return PTR_ERR(region);
+
+	chip->vlan_region = region;
+
+	return 0;
+}
+
+static void rtl8372n_teardown(struct dsa_switch *ds)
+{
+	struct realtek_priv *priv = ds->priv;
+	struct rtl8372n *chip;
+
+	chip = priv->chip_data;
+
+	dsa_devlink_region_destroy(chip->vlan_region);
 }
 
 /* Untagged frames go to the bridge's PVID only while the port filters by
@@ -1863,6 +1937,7 @@ static int rtl8372n_port_vlan_filtering(struct dsa_switch *ds, int port,
 static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.get_tag_protocol = rtl8372n_get_tag_protocol,
 	.setup = rtl8372n_setup,
+	.teardown = rtl8372n_teardown,
 	.phylink_get_caps = rtl8372n_phylink_get_caps,
 	.port_enable = rtl8372n_port_enable,
 	.port_disable = rtl8372n_port_disable,
