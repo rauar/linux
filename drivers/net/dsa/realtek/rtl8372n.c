@@ -88,11 +88,19 @@
 /* Size of the address table: a port with this limit learns without limit */
 #define RTL8372N_L2_TABLE_SIZE			4160
 
-/* What a port does with a unicast frame whose address is not in the table */
+/* What a port does with a frame whose address is not in the table, one
+ * register each for unicast, multicast other than IP, IPv4 and IPv6
+ * multicast
+ */
 #define RTL8372N_L2_UC_LM_ACT_REG		0x5374
-#define RTL8372N_L2_UC_LM_ACT(port)		(GENMASK(1, 0) << ((port) * 2))
-#define RTL8372N_L2_LM_ACT_FLOOD_MASK		0	/* by the flood port mask */
-#define RTL8372N_L2_LM_ACT_DROP			1
+#define RTL8372N_L2_MC_LM_ACT_REG		0x4f74
+#define RTL8372N_IP4_MC_LM_ACT_REG		0x4f78
+#define RTL8372N_IP6_MC_LM_ACT_REG		0x4f7c
+#define RTL8372N_LM_ACT(port)			(GENMASK(1, 0) << ((port) * 2))
+#define RTL8372N_LM_ACT_FLOOD_MASK		0	/* by the flood port mask */
+#define RTL8372N_LM_ACT_DROP			1
+/* Multicast other than IP only: drop, but not the reserved addresses */
+#define RTL8372N_LM_ACT_DROP_NO_RMA		3
 
 /* Remove the learned addresses of the ports in the command */
 #define RTL8372N_L2_FLUSH_CMD_REG		0x53d4
@@ -332,6 +340,7 @@ struct rtl8372n {
 	struct realtek_priv *priv;
 	struct work_struct host_flood_work;
 	unsigned long host_flood_uc;	/* ports that take unknown unicast */
+	unsigned long host_flood_mc;	/* ports that take unknown multicast */
 };
 
 /* Wait until the SerDes access unit has finished its last command */
@@ -946,25 +955,52 @@ static int rtl8372n_setup_learning(struct realtek_priv *priv)
 	return 0;
 }
 
-/* A port that does not ask for unknown unicast (not promiscuous) drops it,
- * so the CPU only gets the addresses DSA put into the table for the host.
+/* Set the lookup miss action of the user ports in @reg: @drop for the ports
+ * that are not in @wanted, flooding by the port mask for the others
  */
-static int rtl8372n_write_host_flood(struct realtek_priv *priv)
+static int rtl8372n_write_lm_act(struct realtek_priv *priv, unsigned int reg,
+				 const unsigned long *wanted, u32 drop)
 {
-	struct rtl8372n *chip = priv->chip_data;
 	struct dsa_port *dp;
 	u32 mask = 0;
 	u32 val = 0;
 
 	dsa_switch_for_each_user_port(dp, &priv->ds) {
-		mask |= RTL8372N_L2_UC_LM_ACT(dp->index);
-		if (!test_bit(dp->index, &chip->host_flood_uc))
-			val |= field_prep(RTL8372N_L2_UC_LM_ACT(dp->index),
-					  RTL8372N_L2_LM_ACT_DROP);
+		mask |= RTL8372N_LM_ACT(dp->index);
+		if (!test_bit(dp->index, wanted))
+			val |= field_prep(RTL8372N_LM_ACT(dp->index), drop);
 	}
 
-	return regmap_update_bits(priv->map, RTL8372N_L2_UC_LM_ACT_REG, mask,
-				  val);
+	return regmap_update_bits(priv->map, reg, mask, val);
+}
+
+/* A port that does not ask for unknown unicast (not promiscuous) or unknown
+ * multicast (neither promiscuous nor all-multicast) drops it, so the CPU
+ * only gets the addresses DSA put into the table for the host.
+ */
+static int rtl8372n_write_host_flood(struct realtek_priv *priv)
+{
+	struct rtl8372n *chip = priv->chip_data;
+	int ret;
+
+	ret = rtl8372n_write_lm_act(priv, RTL8372N_L2_UC_LM_ACT_REG,
+				    &chip->host_flood_uc, RTL8372N_LM_ACT_DROP);
+	if (ret)
+		return ret;
+
+	ret = rtl8372n_write_lm_act(priv, RTL8372N_L2_MC_LM_ACT_REG,
+				    &chip->host_flood_mc,
+				    RTL8372N_LM_ACT_DROP_NO_RMA);
+	if (ret)
+		return ret;
+
+	ret = rtl8372n_write_lm_act(priv, RTL8372N_IP4_MC_LM_ACT_REG,
+				    &chip->host_flood_mc, RTL8372N_LM_ACT_DROP);
+	if (ret)
+		return ret;
+
+	return rtl8372n_write_lm_act(priv, RTL8372N_IP6_MC_LM_ACT_REG,
+				     &chip->host_flood_mc, RTL8372N_LM_ACT_DROP);
 }
 
 static void rtl8372n_host_flood_work(struct work_struct *work)
@@ -1493,6 +1529,11 @@ static void rtl8372n_port_set_host_flood(struct dsa_switch *ds, int port,
 		set_bit(port, &chip->host_flood_uc);
 	else
 		clear_bit(port, &chip->host_flood_uc);
+
+	if (mc)
+		set_bit(port, &chip->host_flood_mc);
+	else
+		clear_bit(port, &chip->host_flood_mc);
 
 	schedule_work(&chip->host_flood_work);
 }
